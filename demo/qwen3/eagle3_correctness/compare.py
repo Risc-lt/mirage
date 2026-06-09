@@ -40,12 +40,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mpk", required=True, help="MPK output JSON")
     ap.add_argument("--ref", required=True, help="reference (sglang) output JSON")
+    ap.add_argument("--prefix", type=int, default=0,
+                    help="if >0, only require the first N tokens to match "
+                         "(the K=1..5 first-50-token correctness bar)")
     args = ap.parse_args()
 
     mpk = load(args.mpk)
     ref = load(args.ref)
     mpk_ids = mpk.get("output_token_ids") or []
     ref_ids = ref.get("output_token_ids") or []
+    if args.prefix > 0:
+        mpk_ids = mpk_ids[:args.prefix]
+        ref_ids = ref_ids[:args.prefix]
 
     print(f"[compare] MPK tokens={len(mpk_ids)}  ref tokens={len(ref_ids)}")
     print(f"[compare] MPK accept_length={mpk.get('accept_length')}  "

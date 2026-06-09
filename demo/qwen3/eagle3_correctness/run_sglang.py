@@ -58,12 +58,20 @@ def main():
     out = llm.generate(
         text,
         sampling_params={"temperature": 0.0, "max_new_tokens": args.max_new_tokens},
+        return_logprob=True,
     )
     llm.shutdown()
 
     gen_text = out["text"]
-    out_ids = tok(gen_text, add_special_tokens=False)["input_ids"]
     meta = out.get("meta_info", {})
+    # Prefer EXACT generated token ids (no detokenize->retokenize artifact).
+    # return_logprob=True populates output_token_logprobs as [(logprob, tok_id,
+    # tok_text), ...]; fall back to re-tokenized text only if absent.
+    otl = meta.get("output_token_logprobs")
+    if otl:
+        out_ids = [entry[1] for entry in otl]
+    else:
+        out_ids = tok(gen_text, add_special_tokens=False)["input_ids"]
     result = {
         "framework": "sglang",
         "target": args.target,
