@@ -980,7 +980,26 @@ if __name__ == "__main__":
             print(f"{generated_ids=}")
             response = tokenizer.decode(generated_ids, skip_special_tokens=True)
             print(response)
-        
+
+        # Optional correctness-harness dump (inert unless MPK_DUMP_JSON is set):
+        # writes generation-only token ids for request 0 in the schema
+        # demo/qwen3/eagle3_correctness/compare.py expects.
+        _dump_path = os.environ.get("MPK_DUMP_JSON")
+        if _dump_path:
+            import json as _json
+            _plen = int(prompt_lengths[0].item())
+            _gen_ids = tokens[0, _plen : step[0].item() + 1].cpu().tolist()
+            _gen_text = tokenizer.decode(
+                tokens[0, _plen : step[0].item() + 1], skip_special_tokens=True
+            )
+            with open(_dump_path, "w") as _f:
+                _json.dump({
+                    "framework": "mpk", "eagle3": True,
+                    "output_token_ids": _gen_ids, "output_text": _gen_text,
+                    "completion_tokens": len(_gen_ids), "accept_length": None,
+                }, _f, indent=2)
+            print(f"[mpk-dump] wrote {_dump_path} ({len(_gen_ids)} gen tokens)")
+
         if total_num_requests > 1:
             print(f"Output length of each batch is same: {(step.max() == step.min()).item()}")
 

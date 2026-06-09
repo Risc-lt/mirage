@@ -351,11 +351,26 @@ struct RuntimeConfig {
 #if defined(MODE_OFFLINE) || defined(MODE_ONLINE) ||                           \
     defined(MODE_ONLINE_NOTOKEN) || defined(MODE_ONLINE_TEST) ||               \
     defined(MODE_ONLINE_PINNED)
-  int *prompt_length;     // Metadata for online/offline serving
-  int *request_ids;       // Metadata for online/offline serving
-  int *page_queue;        // Metadata for online/offline serving
-  int *page_queue_head;   // Metadata for online/offline serving
-  int *page_queue_tail;   // Metadata for online/offline serving
+  int *prompt_length;   // Metadata for online/offline serving
+  int *request_ids;     // Metadata for online/offline serving
+  int *page_queue;      // Metadata for online/offline serving
+  int *page_queue_head; // Metadata for online/offline serving
+  int *page_queue_tail; // Metadata for online/offline serving
+  // --- Independent draft KV mapping (MTP draft extend) ---
+  // The MTP draft owns its own paged-KV mapping, fully separate from the
+  // target's, so it writes KV for the confirmed accepted sequence (its own
+  // draft_step) rather than the target's optimistic K+1 offsets. All draft_
+  // buffers are gpu_malloc'd internally (no Python meta tensors); the draft
+  // pool gets its own free-list slab.
+  int *draft_step;                    // per-request confirmed draft length
+  int *draft_qo_indptr_buffer;        // draft query offsets (1 query/req)
+  int *draft_paged_kv_indptr_buffer;  // per-request page span (draft pool)
+  int *draft_paged_kv_indices_buffer; // page ids in the draft pool
+  int *draft_paged_kv_last_page_len_buffer; // last-page fill (draft pool)
+  int *draft_paged_kv_indices_snapshot;     // compaction snapshot (draft pool)
+  int *draft_page_queue;                    // draft pool free-list
+  int *draft_page_queue_head;
+  int *draft_page_queue_tail;
   int total_num_requests; // Metadata for LLM serving
 #endif
 #if defined(MODE_OFFLINE) || defined(MODE_ONLINE) ||                           \

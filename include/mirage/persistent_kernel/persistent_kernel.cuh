@@ -167,6 +167,19 @@ __global__ void init_kernel(RuntimeConfig config) {
     for (int i = 0; i < MPK_MAX_NUM_PAGES; i++) {
       config.page_queue[i] = i;
     }
+    // Independent draft KV mapping: zeroed indptrs, full free-list, step=0.
+    for (int i = 0; i < config.total_num_requests; i++) {
+      config.draft_step[i] = 0;
+    }
+    for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS + 1; i++) {
+      config.draft_qo_indptr_buffer[i] = 0;
+      config.draft_paged_kv_indptr_buffer[i] = 0;
+    }
+    *config.draft_page_queue_head = 0;
+    *config.draft_page_queue_tail = MPK_MAX_NUM_PAGES;
+    for (int i = 0; i < MPK_MAX_NUM_PAGES; i++) {
+      config.draft_page_queue[i] = i;
+    }
 #if defined(MODE_ONLINE_PINNED)
     // Initialize GPU-private ring cursors (pinned_req_ready[] and
     // pinned_comp_ready[] are already zeroed by Python)
@@ -320,9 +333,8 @@ __device__ __forceinline__ bool
 #ifdef MPK_SPEC_DECODE
         // Eagle3 / spec-decode: feed K+1 candidate tokens (1 bonus + K drafts)
         // per decode iter. mbt is compile-time set to K+1.
-        num_new_tokens =
-            min(MPK_MAX_NUM_BATCHED_TOKENS,
-                MPK_MAX_NUM_BATCHED_TOKENS - num_tokens);
+        num_new_tokens = min(MPK_MAX_NUM_BATCHED_TOKENS,
+                             MPK_MAX_NUM_BATCHED_TOKENS - num_tokens);
 #else
         num_new_tokens = min(1, MPK_MAX_NUM_BATCHED_TOKENS - num_tokens);
 #endif
@@ -402,6 +414,33 @@ __device__ __forceinline__ bool
   // Step 5: update page head tail
   *config.page_queue_head = page_queue_head;
   *config.page_queue_tail = page_queue_tail;
+
+  // Step 5b: mirror the just-finalized target paged-KV mapping into the
+  // independent draft mapping (PR1, behavior-preserving). The draft attention
+  // reads its own draft_* buffers; mirroring here — where the target mapping is
+  // freshly finalized and before any task runs — keeps the draft byte-identical
+  // to the target while decoupling the buffers, with no graph-ordering hazard.
+  // The accepted-count-driven independent advance replaces this mirror once
+  // draft-extend (PR2) lands.
+  {
+    int const draft_total_pages =
+        config.paged_kv_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS];
+    for (int i = 0; i <= MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+      config.draft_qo_indptr_buffer[i] = config.qo_indptr_buffer[i];
+      config.draft_paged_kv_indptr_buffer[i] = config.paged_kv_indptr_buffer[i];
+    }
+    for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+      config.draft_paged_kv_last_page_len_buffer[i] =
+          config.paged_kv_last_page_len_buffer[i];
+    }
+    for (int i = 0; i < draft_total_pages; i++) {
+      config.draft_paged_kv_indices_buffer[i] =
+          config.paged_kv_indices_buffer[i];
+    }
+    for (int i = 0; i < config.total_num_requests; i++) {
+      config.draft_step[i] = config.step[i];
+    }
+  }
 
   // printf("Next batch: steps[%d %d %d %d] num_active_tokens(%d)\n",
   //        config.step[0],
@@ -1662,6 +1701,24 @@ extern "C" void
       gpu_malloc<int>(MPK_MAX_NUM_PAGES * sizeof(int));
   global_runtime_config.page_queue_head = gpu_malloc<int>(sizeof(int));
   global_runtime_config.page_queue_tail = gpu_malloc<int>(sizeof(int));
+  // Independent draft KV mapping: own slab, gpu_malloc'd internally (no Python
+  // meta tensors). Mirrors the target's paged-KV buffers + free-list.
+  global_runtime_config.draft_step =
+      gpu_malloc<int>(sizeof(int) * total_num_requests);
+  global_runtime_config.draft_qo_indptr_buffer =
+      gpu_malloc<int>(sizeof(int) * (MPK_MAX_NUM_BATCHED_REQUESTS + 1));
+  global_runtime_config.draft_paged_kv_indptr_buffer =
+      gpu_malloc<int>(sizeof(int) * (MPK_MAX_NUM_BATCHED_REQUESTS + 1));
+  global_runtime_config.draft_paged_kv_indices_buffer =
+      gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_PAGES);
+  global_runtime_config.draft_paged_kv_last_page_len_buffer =
+      gpu_malloc<int>(sizeof(int) * (MPK_MAX_NUM_BATCHED_REQUESTS + 1));
+  global_runtime_config.draft_paged_kv_indices_snapshot =
+      gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_PAGES);
+  global_runtime_config.draft_page_queue =
+      gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_PAGES);
+  global_runtime_config.draft_page_queue_head = gpu_malloc<int>(sizeof(int));
+  global_runtime_config.draft_page_queue_tail = gpu_malloc<int>(sizeof(int));
   global_runtime_config.total_num_requests = total_num_requests;
 #if defined(MODE_ONLINE_PINNED)
   // GPU-private ring cursors; never accessed by CPU.

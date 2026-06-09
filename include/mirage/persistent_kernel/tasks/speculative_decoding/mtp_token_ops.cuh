@@ -188,4 +188,68 @@ __device__ __forceinline__ void
   }
 }
 
+// --- Build the draft KV mapping (independent draft paged-KV) ---
+// PR1 (behavior-preserving): mirror the target paged-KV mapping into the draft
+// mapping so the draft attention/gather can read its OWN draft_* buffers while
+// reproducing the current (shared-mapping) behavior exactly. This decouples the
+// draft from the target's qo_indptr without changing any output; the later
+// accepted-count-driven independent advance (and the draft's own page
+// free-list) replaces this mirror once draft-extend exists.
+//
+// Single-threaded (free-list / indptr writes are inherently sequential).
+//
+// Inputs  (target mapping, read):  qo_indptr, paged_kv_indptr,
+//   paged_kv_indices, paged_kv_last_page_len, step
+// Outputs (draft mapping, write):  draft_qo_indptr, draft_paged_kv_indptr,
+//   draft_paged_kv_indices, draft_paged_kv_last_page_len, draft_step
+// MAX_BATCHED_REQS = MPK_MAX_NUM_BATCHED_REQUESTS (compile-time).
+template <int MAX_BATCHED_REQS>
+__device__ __forceinline__ void mtp_build_draft_indptr_kernel(
+    void const *__restrict__ qo_indptr_ptr,
+    void const *__restrict__ paged_kv_indptr_ptr,
+    void const *__restrict__ paged_kv_indices_ptr,
+    void const *__restrict__ paged_kv_last_page_len_ptr,
+    void const *__restrict__ step_ptr,
+    void *__restrict__ draft_qo_indptr_ptr,
+    void *__restrict__ draft_paged_kv_indptr_ptr,
+    void *__restrict__ draft_paged_kv_indices_ptr,
+    void *__restrict__ draft_paged_kv_last_page_len_ptr,
+    void *__restrict__ draft_step_ptr,
+    int total_num_requests) {
+  if (threadIdx.x != 0) {
+    return;
+  }
+  int const *__restrict__ qo_indptr = static_cast<int const *>(qo_indptr_ptr);
+  int const *__restrict__ paged_kv_indptr =
+      static_cast<int const *>(paged_kv_indptr_ptr);
+  int const *__restrict__ paged_kv_indices =
+      static_cast<int const *>(paged_kv_indices_ptr);
+  int const *__restrict__ paged_kv_last_page_len =
+      static_cast<int const *>(paged_kv_last_page_len_ptr);
+  int const *__restrict__ step = static_cast<int const *>(step_ptr);
+  int *__restrict__ draft_qo_indptr = static_cast<int *>(draft_qo_indptr_ptr);
+  int *__restrict__ draft_paged_kv_indptr =
+      static_cast<int *>(draft_paged_kv_indptr_ptr);
+  int *__restrict__ draft_paged_kv_indices =
+      static_cast<int *>(draft_paged_kv_indices_ptr);
+  int *__restrict__ draft_paged_kv_last_page_len =
+      static_cast<int *>(draft_paged_kv_last_page_len_ptr);
+  int *__restrict__ draft_step = static_cast<int *>(draft_step_ptr);
+
+  for (int i = 0; i < total_num_requests; i++) {
+    draft_step[i] = step[i];
+  }
+  for (int i = 0; i <= MAX_BATCHED_REQS; i++) {
+    draft_qo_indptr[i] = qo_indptr[i];
+    draft_paged_kv_indptr[i] = paged_kv_indptr[i];
+  }
+  for (int i = 0; i < MAX_BATCHED_REQS; i++) {
+    draft_paged_kv_last_page_len[i] = paged_kv_last_page_len[i];
+  }
+  int const total_pages = paged_kv_indptr[MAX_BATCHED_REQS];
+  for (int i = 0; i < total_pages; i++) {
+    draft_paged_kv_indices[i] = paged_kv_indices[i];
+  }
+}
+
 } // namespace kernel
