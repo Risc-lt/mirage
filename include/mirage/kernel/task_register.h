@@ -190,8 +190,6 @@ public:
                            std::vector<int> const &params);
   int register_eagle3_d2t_remap_task(threadblock::Graph const &bgraph,
                                      std::vector<int> const &params);
-  int register_eagle3_commit_task(threadblock::Graph const &bgraph,
-                                  std::vector<int> const &params);
   int register_mtp_verify_commit_task(threadblock::Graph const &bgraph,
                                       std::vector<int> const &params);
   int register_hidden_gather_accepted_task(threadblock::Graph const &bgraph,

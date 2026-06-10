@@ -2385,36 +2385,6 @@ class PersistentKernel:
         self.kn_graph.customized([*inputs, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "concat", params)
 
-    def eagle3_commit_layer(
-        self,
-        target_argmax: DTensor,     # (batch, 1) int64 — from argmax_reduce (= output_token DTensor)
-        draft_tokens_new: DTensor,  # (batch, K) int64 — this iter's drafts (scatter output)
-        accepted_count: DTensor,    # (batch, 1) int32 — from verify_strict (1st output)
-        tokens_buffer: DTensor,     # (max_requests, max_seq_len) int64 — written in-place
-        num_new_tokens: DTensor,    # (max_requests,) int32 — OUTPUT (= accept_count)
-        drafts_prev: DTensor,       # (max_requests, K) int64 — attach_input cross-iter snapshot dst
-        accept_hist: DTensor,       # (K+2,) int32 — debug: atomicAdd histogram of ac values
-        grid_dim: tuple,
-        block_dim: tuple,
-        num_draft_tokens: int,      # K
-        batch_size: int,            # mbt
-        max_seq_len: int,
-    ):
-        params = [num_draft_tokens, batch_size, max_seq_len]
-        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        tb_graph.new_input(target_argmax, (-1, -1, -1), -1, True)
-        tb_graph.new_input(draft_tokens_new, (-1, -1, -1), -1, True)
-        tb_graph.new_input(accepted_count, (-1, -1, -1), -1, True)
-        tb_graph.new_input(tokens_buffer, (-1, -1, -1), -1, True)
-        tb_graph.new_input(accept_hist, (-1, -1, -1), -1, True)
-        tb_graph.new_input(num_new_tokens, (-1, -1, -1), -1, True)
-        tb_graph.new_input(drafts_prev, (-1, -1, -1), -1, True)
-        self.kn_graph.customized(
-            [target_argmax, draft_tokens_new, accepted_count, tokens_buffer,
-             accept_hist, num_new_tokens, drafts_prev],
-            tb_graph)
-        self.kn_graph.register_task(tb_graph, "eagle3_commit", params)
-
     def mtp_verify_commit_layer(
         self,
         draft_token_ids: DTensor,   # (K,) int64 — this iter's draft chain

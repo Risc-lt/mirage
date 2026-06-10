@@ -1840,92 +1840,90 @@ void sampling_from_logits(torch::Tensor logits,
 }
 
 // ---------------------------------------------------------------------------
-// eagle3_commit kernel wrapper (for the K>1 src_slot regression test, task6).
-// Exposes the commit stage's chain-selection so a unit test can assert which
-// draft slot is committed for next iter. The current kernel forces src_slot=0
-// for K>1 (eagle3_ops.cuh:221) — the bug PR2 fixes.
+// mtp_verify_commit kernel wrapper (task6 regression, PR2). The merged
+// verify+commit replaced eagle3_commit and DROPPED the K>1 src_slot=0 chain
+// selection. The unit test asserts the correct post-fix behavior: the strict
+// accept-walk + confirmed-token write + accepted_count, with NO slot-selection
+// of the draft chain (the next chain is produced by the extend stage).
 // ---------------------------------------------------------------------------
-using kernel::eagle3_commit_kernel;
+using kernel::mtp_verify_commit_kernel;
 
-template <int K, int BATCH_SIZE, int MAX_SEQ_LEN>
-__global__ void eagle3_commit_kernel_wrapper(void *tokens_buffer_ptr,
-                                             void const *argmax_out_ptr,
-                                             void const *draft_tokens_new_ptr,
-                                             void const *accepted_count_ptr,
-                                             void const *step_ptr,
-                                             void const *prompt_length_ptr,
-                                             void *new_token_nums_ptr,
-                                             void *drafts_prev_ptr,
-                                             void *accept_hist_ptr,
-                                             int request_id) {
-  eagle3_commit_kernel<K, BATCH_SIZE, MAX_SEQ_LEN>(tokens_buffer_ptr,
-                                                   argmax_out_ptr,
-                                                   draft_tokens_new_ptr,
-                                                   accepted_count_ptr,
-                                                   step_ptr,
-                                                   prompt_length_ptr,
-                                                   new_token_nums_ptr,
-                                                   drafts_prev_ptr,
-                                                   accept_hist_ptr,
-                                                   request_id);
+template <int K, int MAX_SEQ_LEN>
+__global__ void
+    mtp_verify_commit_kernel_wrapper(void const *draft_token_ids_ptr,
+                                     void const *argmax_out_ptr,
+                                     void const *step_ptr,
+                                     void const *prompt_length_ptr,
+                                     void *tokens_buffer_ptr,
+                                     void *new_token_nums_ptr,
+                                     void *accepted_count_out_ptr,
+                                     void *accept_hist_ptr,
+                                     int request_id) {
+  mtp_verify_commit_kernel<K, MAX_SEQ_LEN>(draft_token_ids_ptr,
+                                           argmax_out_ptr,
+                                           step_ptr,
+                                           prompt_length_ptr,
+                                           tokens_buffer_ptr,
+                                           new_token_nums_ptr,
+                                           accepted_count_out_ptr,
+                                           accept_hist_ptr,
+                                           request_id);
 }
 
-void eagle3_commit(torch::Tensor tokens_buffer,    // [MAX_REQ, MAX_SEQ_LEN] i64
-                   torch::Tensor argmax_out,       // [K+1] i64
-                   torch::Tensor draft_tokens_new, // [BATCH_SIZE, K] i64
-                   torch::Tensor accepted_count,   // [1] i32
-                   torch::Tensor step,             // [MAX_REQ] i32
-                   torch::Tensor prompt_length,    // [MAX_REQ] i32
-                   torch::Tensor new_token_nums,   // [MAX_REQ] i32
-                   torch::Tensor drafts_prev,      // [MAX_REQ, K] i64
-                   torch::Tensor accept_hist,      // [K+2] i32
-                   int K,
-                   int batch_size,
-                   int max_seq_len,
-                   int request_id) {
+void mtp_verify_commit(torch::Tensor draft_token_ids, // [K] i64
+                       torch::Tensor argmax_out,      // [K+1] i64
+                       torch::Tensor step,            // [MAX_REQ] i32
+                       torch::Tensor prompt_length,   // [MAX_REQ] i32
+                       torch::Tensor tokens_buffer,   // [MAX_REQ,MAX_SEQ] i64
+                       torch::Tensor new_token_nums,  // [MAX_REQ] i32
+                       torch::Tensor accepted_count_out, // [1] i32
+                       torch::Tensor accept_hist,        // [K+2] i32
+                       int K,
+                       int max_seq_len,
+                       int request_id) {
   dim3 grid_dim(1, 1, 1);
   dim3 block_dim(32, 1, 1);
-#define LAUNCH_COMMIT(K_, BS_, MSL_)                                           \
-  eagle3_commit_kernel_wrapper<K_, BS_, MSL_>                                  \
-      <<<grid_dim, block_dim>>>(tokens_buffer.data_ptr(),                      \
+#define LAUNCH_VC(K_, MSL_)                                                    \
+  mtp_verify_commit_kernel_wrapper<K_, MSL_>                                   \
+      <<<grid_dim, block_dim>>>(draft_token_ids.data_ptr(),                    \
                                 argmax_out.data_ptr(),                         \
-                                draft_tokens_new.data_ptr(),                   \
-                                accepted_count.data_ptr(),                     \
                                 step.data_ptr(),                               \
                                 prompt_length.data_ptr(),                      \
+                                tokens_buffer.data_ptr(),                      \
                                 new_token_nums.data_ptr(),                     \
-                                drafts_prev.data_ptr(),                        \
+                                accepted_count_out.data_ptr(),                 \
                                 accept_hist.data_ptr(),                        \
                                 request_id)
-  // Test matrix only needs K in {1,2,3}, BATCH_SIZE=K+1, MAX_SEQ_LEN=512.
+  // Test matrix needs K in {1,2,3}, MAX_SEQ_LEN=512.
   if (max_seq_len == 512) {
-    if (K == 1 && batch_size == 2) {
-      LAUNCH_COMMIT(1, 2, 512);
-    } else if (K == 2 && batch_size == 3) {
-      LAUNCH_COMMIT(2, 3, 512);
-    } else if (K == 3 && batch_size == 4) {
-      LAUNCH_COMMIT(3, 4, 512);
+    if (K == 1) {
+      LAUNCH_VC(1, 512);
+    } else if (K == 2) {
+      LAUNCH_VC(2, 512);
+    } else if (K == 3) {
+      LAUNCH_VC(3, 512);
     } else {
-      printf(
-          "eagle3_commit: unsupported (K=%d, batch_size=%d)\n", K, batch_size);
+      printf("mtp_verify_commit: unsupported K=%d\n", K);
     }
   } else {
-    printf("eagle3_commit: unsupported max_seq_len=%d (test uses 512)\n",
+    printf("mtp_verify_commit: unsupported max_seq_len=%d (test uses 512)\n",
            max_seq_len);
   }
-#undef LAUNCH_COMMIT
+#undef LAUNCH_VC
   cudaError_t err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
-    printf("CUDA eagle3_commit launch error: %s\n", cudaGetErrorString(err));
+    printf("CUDA mtp_verify_commit launch error: %s\n",
+           cudaGetErrorString(err));
   }
 }
 
 // pybind11 bindings
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("eagle3_commit",
-        &eagle3_commit,
-        "Eagle3 commit kernel (verify-aware token write + chain select)");
+  m.def(
+      "mtp_verify_commit",
+      &mtp_verify_commit,
+      "MTP merged verify+commit (strict accept-walk + confirmed-token write)");
   // m.def("prompt_lookup", &prompt_lookup, "Prompt lookup kernel");
   // m.def("embedding", &embedding, "Embedding kernel");
   // m.def("linear", &linear, "Linear kernel");

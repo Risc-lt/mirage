@@ -848,14 +848,6 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id = task_register->register_eagle3_d2t_remap_task(
         customized->bgraph, params);
     task_config[op] = std::make_tuple(2, 1, TASK_EAGLE3_D2T_REMAP, variant_id);
-  } else if (name == "eagle3_commit") {
-    int variant_id =
-        task_register->register_eagle3_commit_task(customized->bgraph, params);
-    // Inputs:  argmax_out, draft_tokens_new, accepted_count, tokens_buffer,
-    //          accept_hist (attach_input, kernel writes via atomicAdd; debug)
-    // Outputs: new_token_nums, drafts_prev (cross-iter snapshot)
-    // (step / prompt_length read from runtime_config)
-    task_config[op] = std::make_tuple(5, 2, TASK_EAGLE3_COMMIT, variant_id);
   } else if (name == "mtp_verify_commit") {
     int variant_id = task_register->register_mtp_verify_commit_task(
         customized->bgraph, params);
