@@ -92,12 +92,12 @@ class Eagle3Builder:
         #   mpk.mtp_verify_commit_layer(...)            # verify + commit
         #   eagle3.prepare_draft_input(aux_h0,h1,h2, accepted_count)
         #   eagle3.build_draft_extend(seed_token, accepted_count)
-        #   mpk.mtp_snapshot_drafts_layer(all_draft_ids, drafts_prev, ...)
+        #   mpk.mtp_draft_token_copy_layer(all_draft_ids, accepted_count, tokens)
         # eagle3.all_draft_ids holds the per-step draft token IDs for verify.
 
     The legacy build_draft_loop / eagle3_commit (q_len_override KV-chain) design
     was removed in PR2; mtp_verify_commit + prepare_draft_input +
-    build_draft_extend + mtp_snapshot_drafts replace it.
+    build_draft_extend + mtp_draft_token_copy replace it.
     """
 
     def __init__(
@@ -348,17 +348,21 @@ class Eagle3Builder:
     def prepare_draft_input(self, aux_h0, aux_h1, aux_h2, accepted_count):
         """Integrate the draft's step-0 input AFTER verify, BEFORE extend.
 
-        Produces self.extend_seed_hidden = the target hidden (after the eagle3
-        aux fc projection) gathered at the accepted positions [0..accepted_count).
-        Rows beyond accepted_count are zero (never read by the draft).
+        eagle3: concat(aux_h0,h1,h2) → w_fc (3H→H) → self.hidden_in, the full
+        mbt-row projected target hidden that seeds build_draft_extend's step 0.
 
-        eagle3 specifics live here: concat(aux_h0,h1,h2) → w_fc (3H→H) → gather
-        accepted rows. For DeepSeek (PR4) this method is replaced by the MTP
-        input integration (its hidden+token concat → eh_proj).
+        NOTE: eagle3's draft is mbt-PARALLEL — all mbt rows carry valid target
+        hidden, so we do NOT route the seed through hidden_gather_accepted (which
+        zeros rows >= accepted_count): that both collapses the accept rate AND
+        makes hidden_in a fork-producer (gather + extend both consume it) →
+        build_annotated_graph case-3 crash. The accepted-row gather is the
+        DeepSeek single-chain MTP formulation (PR4), where hidden_gather_accepted
+        + extend_seed_hidden are used; for eagle3 the extend reads hidden_in
+        directly. (accepted_count is consumed by mtp_verify_commit; the draft
+        mapping advance uses it via mtp_build_draft_indptr — not needed for the
+        eagle3 mbt-parallel seed.)
         """
         bd = (256, 1, 1) if self.mpk.target_cc >= 90 else (128, 1, 1)
-        K = self.num_draft_steps
-        H = self.hidden_size
         # concat aux hiddens → fc (the eagle3 "target hidden" projection).
         self.mpk.concat_layer(
             inputs=[aux_h0, aux_h1, aux_h2],
@@ -371,15 +375,7 @@ class Eagle3Builder:
             grid_dim=(grid_for_rmsnorm_linear_layer(self.w_fc.dim(0)), 1, 1),
             block_dim=bd,
         )
-        # gather rows [0..accepted_count) of the projected hidden → seed.
-        self.mpk.hidden_gather_accepted_layer(
-            verify_hidden=self.hidden_in,
-            accepted_count=accepted_count,
-            extend_seed=self.extend_seed_hidden,
-            grid_dim=(K + 1, 1, 1), block_dim=bd,
-            num_draft_tokens=K, hidden_dim=H,
-        )
-        return self.extend_seed_hidden
+        return self.hidden_in
 
     def _gqa_attn(self, attn_in, attn_out, bd):
         """Pluggable attention sub-step for the eagle3/qwen3 draft (GQA).
@@ -418,7 +414,14 @@ class Eagle3Builder:
 
         for step in range(K):
             draft_in_token = seed_token if step == 0 else self.target_token
-            step_hidden = self.extend_seed_hidden if step == 0 else self.draft_hidden
+            # eagle3's draft processes all mbt parallel rows; step-0 hidden is
+            # the FULL projected target hidden (concat(aux)→fc = self.hidden_in,
+            # produced by prepare_draft_input). NOTE: do NOT use the
+            # accepted-only gathered seed here — zeroing rows >= accepted_count
+            # feeds the draft's parallel branches zero hidden and collapses the
+            # accept rate. The accepted-row gather is the DeepSeek single-chain
+            # MTP formulation (PR4), not eagle3's mbt-parallel structure.
+            step_hidden = self.hidden_in if step == 0 else self.draft_hidden
 
             self.mpk.embed_layer(
                 input=draft_in_token, weight=self.target_w_embed,

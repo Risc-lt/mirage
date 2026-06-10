@@ -204,9 +204,9 @@ enum TaskType {
   // Gather target verify-hidden rows [0..accepted_count-1] into the
   // draft-extend seed buffer (PR2).
   TASK_HIDDEN_GATHER_ACCEPTED = 297,
-  // Snapshot this iter's draft chain (all_draft_ids row-0) into the drafts_prev
-  // attach_input for next iter's mtp_verify_commit (PR2).
-  TASK_MTP_SNAPSHOT_DRAFTS = 299,
+  // Copy this iter's draft chain (all_draft_ids row-0) into the global token
+  // buffer at tokens[step+ac+1..step+ac+K] for next iter's verify (PR2).
+  TASK_MTP_DRAFT_TOKEN_COPY = 299,
   TASK_SM100_TASK_END = 298, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,

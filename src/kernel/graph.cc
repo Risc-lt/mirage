@@ -851,11 +851,11 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
   } else if (name == "mtp_verify_commit") {
     int variant_id = task_register->register_mtp_verify_commit_task(
         customized->bgraph, params);
-    // Inputs:  draft_token_ids, argmax_out, tokens_buffer (write-through),
-    //          accept_hist (attach_input; debug)
+    // Inputs:  argmax_out, tokens_buffer (write-through; ALSO supplies the
+    //          draft chain at [step+1..step+K]), accept_hist (attach_input)
     // Outputs: new_token_nums, accepted_count_out
     // (step / prompt_length read from runtime_config)
-    task_config[op] = std::make_tuple(4, 2, TASK_MTP_VERIFY_COMMIT, variant_id);
+    task_config[op] = std::make_tuple(3, 2, TASK_MTP_VERIFY_COMMIT, variant_id);
   } else if (name == "hidden_gather_accepted") {
     int variant_id = task_register->register_hidden_gather_accepted_task(
         customized->bgraph, params);
@@ -863,13 +863,15 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // Outputs: extend_seed [K+1,H]
     task_config[op] =
         std::make_tuple(2, 1, TASK_HIDDEN_GATHER_ACCEPTED, variant_id);
-  } else if (name == "mtp_snapshot_drafts") {
-    int variant_id = task_register->register_mtp_snapshot_drafts_task(
+  } else if (name == "mtp_draft_token_copy") {
+    int variant_id = task_register->register_mtp_draft_token_copy_task(
         customized->bgraph, params);
-    // Inputs:  all_draft_ids [mbt,K] (scatter output edge)
-    // Outputs: drafts_prev [MAX_REQ,K] (attach_input, non-edge)
+    // Inputs:  all_draft_ids [mbt,K] (scatter output edge),
+    //          accepted_count (in-graph)
+    // Outputs: tokens_buffer [MAX_REQ,MAX_SEQ_LEN] (attach_input, non-edge)
+    // (step read from runtime_config)
     task_config[op] =
-        std::make_tuple(1, 1, TASK_MTP_SNAPSHOT_DRAFTS, variant_id);
+        std::make_tuple(2, 1, TASK_MTP_DRAFT_TOKEN_COPY, variant_id);
   }
   // Multi-GPU tasks
   else if (name == "nvshmem_allgather_strided_put") {

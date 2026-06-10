@@ -4452,10 +4452,11 @@ int TaskRegister::register_eagle3_d2t_remap_task(
 int TaskRegister::register_mtp_verify_commit_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // params[0]: K (= num_draft_steps), params[1]: max_seq_len
-  // Merged verify+commit for the draft-extend path. Inputs: draft_token_ids,
-  // argmax_out, tokens_buffer (write-through), accept_hist (attach_input).
-  // Outputs: new_token_nums, accepted_count_out. step/prompt_length are
-  // globals.
+  // Merged verify+commit for the draft-extend path. Inputs: argmax_out,
+  // tokens_buffer (write-through; ALSO supplies the draft chain at
+  // [step+1..step+K], written by mtp_draft_token_copy), accept_hist
+  // (attach_input). Outputs: new_token_nums, accepted_count_out.
+  // step/prompt_length are globals.
   assert(params.size() == 2);
   int K = params[0];
   int max_seq_len = params[1];
@@ -4463,14 +4464,13 @@ int TaskRegister::register_mtp_verify_commit_task(
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
   code.e("kernel::mtp_verify_commit_kernel<$, $>(", K, max_seq_len);
-  code.e("    task_desc->input_ptrs[0],");     // draft_token_ids
-  code.e("    task_desc->input_ptrs[1],");     // argmax_out (K+1)
+  code.e("    task_desc->input_ptrs[0],");     // argmax_out (K+1)
   code.e("    runtime_config.step,");          // step (global)
   code.e("    runtime_config.prompt_length,"); // prompt_length (global)
-  code.e("    task_desc->input_ptrs[2],");     // tokens_buffer (write-thru)
+  code.e("    task_desc->input_ptrs[1],");     // tokens_buffer (write-thru)
   code.e("    task_desc->output_ptrs[0],");    // new_token_nums
   code.e("    task_desc->output_ptrs[1],");    // accepted_count_out
-  code.e("    task_desc->input_ptrs[3],");     // accept_hist (attach_input)
+  code.e("    task_desc->input_ptrs[2],");     // accept_hist (attach_input)
   code.e("    task_desc->task_metadata.request_id);"); // request_id
   return register_task_variant(TASK_MTP_VERIFY_COMMIT, code.to_string());
 }
@@ -4492,19 +4492,26 @@ int TaskRegister::register_hidden_gather_accepted_task(
   return register_task_variant(TASK_HIDDEN_GATHER_ACCEPTED, code.to_string());
 }
 
-int TaskRegister::register_mtp_snapshot_drafts_task(
+int TaskRegister::register_mtp_draft_token_copy_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
-  // params[0]: K (= num_draft_steps), params[1]: mbt
+  // params[0]: K (= num_draft_steps), params[1]: max_seq_len
+  // Copies all_draft_ids row-0 → tokens[step+ac+1..step+ac+K] for next iter's
+  // verify. Inputs: all_draft_ids, accepted_count. Output: tokens_buffer
+  // (write-through; attach_input cross-iter carrier). step is a global.
   assert(params.size() == 2);
   int K = params[0];
-  int mbt = params[1];
+  int max_seq_len = params[1];
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::mtp_snapshot_drafts_kernel<$, $>(", K, mbt);
-  code.e("    task_desc->input_ptrs[0],");   // all_draft_ids [mbt, K]
-  code.e("    task_desc->output_ptrs[0]);"); // drafts_prev [MAX_REQ, K]
-  return register_task_variant(TASK_MTP_SNAPSHOT_DRAFTS, code.to_string());
+  code.e("kernel::mtp_draft_token_copy_kernel<$, $>(", K, max_seq_len);
+  code.e("    task_desc->input_ptrs[0],");     // all_draft_ids [mbt, K]
+  code.e("    runtime_config.step,");          // step (global)
+  code.e("    runtime_config.prompt_length,"); // prompt_length (global)
+  code.e("    task_desc->input_ptrs[1],");     // accepted_count (in-graph)
+  code.e("    task_desc->output_ptrs[0],");    // tokens_buffer (write-thru)
+  code.e("    task_desc->task_metadata.request_id);"); // request_id
+  return register_task_variant(TASK_MTP_DRAFT_TOKEN_COPY, code.to_string());
 }
 
 // ============ MLA-MTP TP variants (ferret-derived, no-PDL) ============

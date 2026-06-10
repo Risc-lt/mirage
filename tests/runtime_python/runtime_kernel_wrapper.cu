@@ -1848,6 +1848,10 @@ void sampling_from_logits(torch::Tensor logits,
 // ---------------------------------------------------------------------------
 using kernel::mtp_verify_commit_kernel;
 
+// The draft chain is now read from tokens_buffer[step+1..step+K] (the prev
+// iter's mtp_draft_token_copy placed it there). The wrapper seeds it there from
+// the test's draft_token_ids before invoking the kernel, then runs the kernel
+// (which no longer takes a separate draft_token_ids input).
 template <int K, int MAX_SEQ_LEN>
 __global__ void
     mtp_verify_commit_kernel_wrapper(void const *draft_token_ids_ptr,
@@ -1859,8 +1863,20 @@ __global__ void
                                      void *accepted_count_out_ptr,
                                      void *accept_hist_ptr,
                                      int request_id) {
-  mtp_verify_commit_kernel<K, MAX_SEQ_LEN>(draft_token_ids_ptr,
-                                           argmax_out_ptr,
+  // Seed the draft chain into tokens[req*MAX_SEQ_LEN + step + 1 + i] (single
+  // thread; the kernel below reads exactly these positions in its accept-walk).
+  if (threadIdx.x == 0) {
+    long long const *draft_ids =
+        static_cast<long long const *>(draft_token_ids_ptr);
+    long long *tokens = static_cast<long long *>(tokens_buffer_ptr);
+    int const *step = static_cast<int const *>(step_ptr);
+    int cur_step = step[request_id];
+    for (int i = 0; i < K; i++) {
+      tokens[request_id * MAX_SEQ_LEN + cur_step + 1 + i] = draft_ids[i];
+    }
+  }
+  __syncthreads();
+  mtp_verify_commit_kernel<K, MAX_SEQ_LEN>(argmax_out_ptr,
                                            step_ptr,
                                            prompt_length_ptr,
                                            tokens_buffer_ptr,

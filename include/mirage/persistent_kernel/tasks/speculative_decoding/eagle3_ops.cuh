@@ -131,7 +131,8 @@ __device__ __forceinline__ void
 // (`_build_draft_extend`), which re-seeds the draft from the confirmed tokens +
 // the target hidden at the accepted positions. So this kernel's only jobs are:
 //
-//   1. Strict accept-walk: compare draft_token_ids[0..K-1] vs the target's
+//   1. Strict accept-walk: compare the previous iter's draft chain (carried in
+//      tokens[step+1..step+K], written by mtp_draft_token_copy) vs the target's
 //      argmax[0..K-1]; accept the matching prefix; accepted_count = (#accepted)
 //      + 1 for the bonus token (lies in [1, K+1]).
 //   2. Write the confirmed tokens (= target argmax over the accepted prefix +
@@ -150,10 +151,10 @@ __device__ __forceinline__ void
 // per the path boundaries); the enum is the seam for future policies.
 //
 // Inputs:
-//   draft_token_ids   [K]                    int64 — this iter's draft chain
 //   argmax_out        [K+1]                  int64 — target argmax (K+1 pos)
 //   step              [MAX_REQ]              int32 — current confirmed length
 //   prompt_length     [MAX_REQ]              int32 — req's prompt length
+//   tokens_buffer also supplies the draft chain at [step+1..step+K] (see #1)
 // Outputs:
 //   tokens_buffer     [MAX_REQ, MAX_SEQ_LEN] int64 — confirmed-token write
 //   new_token_nums    [MAX_REQ]              int32 — accepted_count for runtime
@@ -165,8 +166,7 @@ template <int K,
           int MAX_SEQ_LEN,
           AcceptPolicy POLICY = AcceptPolicy::STRICT_GREEDY>
 __device__ __forceinline__ void
-    mtp_verify_commit_kernel(void const *__restrict__ draft_token_ids_ptr,
-                             void const *__restrict__ argmax_out_ptr,
+    mtp_verify_commit_kernel(void const *__restrict__ argmax_out_ptr,
                              void const *__restrict__ step_ptr,
                              void const *__restrict__ prompt_length_ptr,
                              void *__restrict__ tokens_buffer_ptr,
@@ -177,8 +177,6 @@ __device__ __forceinline__ void
   static_assert(POLICY == AcceptPolicy::STRICT_GREEDY,
                 "mtp_verify_commit: only STRICT_GREEDY implemented in PR2");
 
-  long long const *__restrict__ draft_ids =
-      static_cast<long long const *>(draft_token_ids_ptr);
   long long const *__restrict__ argmax =
       static_cast<long long const *>(argmax_out_ptr);
   int const *__restrict__ step = static_cast<int const *>(step_ptr);
@@ -192,12 +190,24 @@ __device__ __forceinline__ void
   int t_id = threadIdx.x;
   int req = request_id;
 
+  int cur_step = step[req];
+  int prompt_len = prompt_length[req];
+
   // 1. Strict accept-walk (single-thread; K is tiny so no need to parallelize).
+  //    The draft chain for THIS iter lives in tokens[cur_step+1 .. cur_step+K]:
+  //    the previous iter's draft-token copy (mtp_draft_token_copy) wrote it
+  //    there, and prepare_next_batch advanced step to point at it. tokens is an
+  //    attach_input carried across the iteration barrier, so this read is the
+  //    same cross-iter carrier drafts_prev used to be (BL-20260610). Step 2
+  //    below overwrites tokens[cur_step+1 ..] with the confirmed argmax, but
+  //    the
+  //    __syncthreads() guarantees every thread finishes this read first.
   __shared__ int ac_smem;
   if (t_id == 0) {
     int accepted = K;
     for (int i = 0; i < K; i++) {
-      if (draft_ids[i] != argmax[i]) {
+      long long draft_i = tokens[req * MAX_SEQ_LEN + cur_step + 1 + i];
+      if (draft_i != argmax[i]) {
         accepted = i;
         break;
       }
@@ -206,9 +216,6 @@ __device__ __forceinline__ void
   }
   __syncthreads();
   int ac = ac_smem;
-
-  int cur_step = step[req];
-  int prompt_len = prompt_length[req];
 
   // 2. Write confirmed tokens at step+1 .. step+ac (only past prompt). Values
   //    come from the target argmax over the accepted prefix + bonus.

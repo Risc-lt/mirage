@@ -781,20 +781,20 @@ if __name__ == "__main__":
         if args.eagle3:
             # === Eagle3 draft + verify wiring ===
             #
-            # Cross-iter draft snapshot design:
-            # - eagle3_drafts_prev is an attach_input tensor (MPK does NOT
-            #   track its writers as task graph edges).
-            # - verify_strict reads drafts_prev. MPK only sees other deps for
-            #   verify (argmax_out from argmax_reduce, accepted_count out).
-            # - eagle3_commit writes drafts_prev at end of iter (its
-            #   draft_tokens_new input is this iter's scatter output).
-            # - Across iters, MPK guarantees iter N tasks complete before
-            #   iter N+1 starts, so iter N+1's verify reads iter N's snapshot.
+            # Cross-iter draft chain design (single carrier, BL-20260610):
+            # - d_tokens (the global token buffer) is an attach_input (MPK does
+            #   NOT track its writers as task graph edges).
+            # - mtp_draft_token_copy writes this iter's draft chain into d_tokens
+            #   at [step+ac+1..step+ac+K] at iter end.
+            # - mtp_verify_commit reads the previous iter's draft chain back from
+            #   d_tokens at [step+1..step+K] (prepare_next_batch advanced step).
+            # - Across iters, MPK guarantees iter N tasks complete before iter
+            #   N+1 starts, so iter N+1's verify reads iter N's draft chain.
             #
-            # At iter 0 the drafts_prev buffer is zero-initialized → verify
-            # accepts 0 tokens, commits only the 1 bonus token. Prefill must
-            # therefore be handled by pre-seeding `tokens` with the prompt
-            # before the first mpk() call (existing demo pattern).
+            # At iter 0 the draft positions are zero → verify accepts 0 tokens,
+            # commits only the 1 bonus token. Prefill must therefore be handled
+            # by pre-seeding `tokens` with the prompt before the first mpk()
+            # call (existing demo pattern).
             from mirage.mpk.models.eagle3.builder import (
                 Eagle3Builder, load_eagle3_draft,
             )
@@ -819,17 +819,10 @@ if __name__ == "__main__":
                 dims=(mbt_e, 1), dtype=mi.int32,
                 name="eagle3_accepted_count", io_category="cuda_tensor",
             )
-            # Cross-iter snapshot buffer: written by mtp_snapshot_drafts at end
-            # of iter N, read by mtp_verify_commit at start of iter N+1. (mbt, K)
-            # match all_draft_ids / verify's read pattern: draft[bid*K + k].
-            eagle3_drafts_prev_buf = torch.zeros(
-                (mbt_e, K), dtype=torch.int64, device="cuda")
-            eagle3_drafts_prev = mpk.attach_input(
-                torch_tensor=eagle3_drafts_prev_buf,
-                name="eagle3_drafts_prev",
-            )
-
-            # Attach_inputs for the draft-extend pipeline.
+            # Attach_inputs for the draft-extend pipeline. d_tokens is the
+            # cross-iter carrier for BOTH confirmed tokens AND the draft chain:
+            # mtp_draft_token_copy writes the draft chain into it at iter end,
+            # and next iter's verify reads the chain back from it (BL-20260610).
             d_tokens = mpk.attach_input(
                 torch_tensor=tokens, name="eagle3_commit_tokens")
             d_num_new = mpk.attach_input(
@@ -843,20 +836,21 @@ if __name__ == "__main__":
             # Draft-extend pipeline (sglang-style; PR2). This is THE eagle3
             # spec-decode path — the legacy verify_strict → build_draft_loop →
             # eagle3_commit design (q_len_override KV chain) was removed.
-            #   mtp_verify_commit (reads prev-iter drafts_prev attach_input;
-            #     writes accepted_count + confirmed tokens + new_token_nums)
+            #   mtp_verify_commit (reads prev-iter draft chain from d_tokens at
+            #     [step+1..step+K]; writes accepted_count + confirmed tokens +
+            #     new_token_nums)
             #   → prepare_draft_input (gather target hidden at accepted rows →
             #     fc projection → extend_seed_hidden)
             #   → build_draft_extend (draft prefill on the prepared seed; GQA
             #     attention over the draft mapping → all_draft_ids)
-            #   → mtp_snapshot_drafts (all_draft_ids → drafts_prev for the NEXT
-            #     iter's verify; drafts_prev stays an attach_input so the
-            #     cross-iter read rides the iteration barrier, BL-20260530).
+            #   → mtp_draft_token_copy (all_draft_ids → d_tokens at
+            #     [step+ac+1..step+ac+K] for the NEXT iter's verify; d_tokens is
+            #     an attach_input so the cross-iter read rides the iteration
+            #     barrier, BL-20260530/BL-20260610).
             eagle3._prepare_weights()
             eagle3._attach_weights()
             eagle3._allocate_intermediates()
             mpk.mtp_verify_commit_layer(
-                draft_token_ids=eagle3_drafts_prev,
                 argmax_out=argmax_out,
                 tokens_buffer=d_tokens,
                 accept_hist=d_accept_hist,
@@ -874,11 +868,12 @@ if __name__ == "__main__":
             eagle3.build_draft_extend(
                 seed_token=argmax_out, accepted_count=accepted_count,
             )
-            mpk.mtp_snapshot_drafts_layer(
+            mpk.mtp_draft_token_copy_layer(
                 all_draft_ids=eagle3._attach_cache["eagle3_all_draft_ids"],
-                drafts_prev=eagle3_drafts_prev,
+                accepted_count=accepted_count,
+                tokens_buffer=d_tokens,
                 grid_dim=(1, 1, 1), block_dim=(128, 1, 1),
-                num_draft_tokens=K, mbt=mbt_e,
+                num_draft_tokens=K, max_seq_len=args.max_seq_length,
             )
         elif spec_decode_config:
             verify_out = mpk.verify_layer_dispatcher(
@@ -1012,7 +1007,9 @@ if __name__ == "__main__":
                 for s in range(K):
                     print(f"[eagle3-debug] step {s} accept rate: {step_rates[s]:.3f} ({step_accepts[s]}/{total_iters})")
                 print(f"[eagle3-debug] per-draft accept rate: {per_draft:.3f}")
-            # Dump per-iter trace: (ac, argmax[0..K], old_drafts_prev[0..K-1])
+            # Dump per-iter trace: (ac, argmax[0..K], prev draft chain[0..K-1]).
+            # The prev draft chain is now read from d_tokens (BL-20260610); the
+            # trace fields are only populated if mtp_verify_commit records them.
             trace_count = min(buf[K + 2], 16)
             record_size = 2 * K + 2
             print(f"[eagle3-debug] trace_count={trace_count} record_size={record_size}")
@@ -1020,7 +1017,7 @@ if __name__ == "__main__":
                 base = K + 3 + it * record_size
                 ac = buf[base + 0]
                 argmax = buf[base + 1 : base + 1 + (K + 1)]
-                old_drafts = buf[base + 1 + (K + 1) : base + 1 + (K + 1) + K]
-                print(f"[eagle3-debug] iter {it}: ac={ac} argmax={argmax} old_drafts_prev={old_drafts}")
+                prev_drafts = buf[base + 1 + (K + 1) : base + 1 + (K + 1) + K]
+                print(f"[eagle3-debug] iter {it}: ac={ac} argmax={argmax} prev_drafts={prev_drafts}")
     if world_size > 1:
         dist.destroy_process_group()

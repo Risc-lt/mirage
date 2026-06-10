@@ -2387,9 +2387,9 @@ class PersistentKernel:
 
     def mtp_verify_commit_layer(
         self,
-        draft_token_ids: DTensor,   # (K,) int64 — this iter's draft chain
         argmax_out: DTensor,        # (K+1,) int64 — target argmax over K+1 pos
-        tokens_buffer: DTensor,     # (max_requests, max_seq_len) int64 — write-thru
+        tokens_buffer: DTensor,     # (max_requests, max_seq_len) int64 — write-thru;
+                                    # ALSO supplies the draft chain at [step+1..step+K]
         accept_hist: DTensor,       # (K+2,) int32 — debug histogram
         new_token_nums: DTensor,    # (max_requests,) int32 — OUTPUT (= accept_count)
         accepted_count_out: DTensor,# (1,) int32 — OUTPUT in-graph accepted_count
@@ -2401,24 +2401,25 @@ class PersistentKernel:
         """Merged verify+commit for the draft-extend path (PR2).
 
         Strict accept-walk + confirmed-token write + new_token_nums + in-graph
-        accepted_count_out. Drops the eagle3_commit src_slot selection (the next
-        draft chain comes from the extend stage, not a slot).
+        accepted_count_out. The draft chain is read from tokens_buffer itself at
+        [step+1..step+K] (written by mtp_draft_token_copy last iter, carried
+        across the iteration barrier — tokens_buffer is an attach_input), so
+        there is no separate draft_token_ids input (BL-20260610).
 
         Input/output order MUST match register_mtp_verify_commit_task codegen:
-          input_ptrs[0]=draft_token_ids, [1]=argmax_out, [2]=tokens_buffer,
-          [3]=accept_hist ; output_ptrs[0]=new_token_nums, [1]=accepted_count_out.
+          input_ptrs[0]=argmax_out, [1]=tokens_buffer, [2]=accept_hist ;
+          output_ptrs[0]=new_token_nums, [1]=accepted_count_out.
         (step/prompt_length are read from runtime_config, not task inputs.)
         """
         params = [num_draft_tokens, max_seq_len]
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
-        tb_graph.new_input(draft_token_ids, (-1, -1, -1), -1, True)
         tb_graph.new_input(argmax_out, (-1, -1, -1), -1, True)
         tb_graph.new_input(tokens_buffer, (-1, -1, -1), -1, True)
         tb_graph.new_input(accept_hist, (-1, -1, -1), -1, True)
         tb_graph.new_input(new_token_nums, (-1, -1, -1), -1, True)
         tb_graph.new_input(accepted_count_out, (-1, -1, -1), -1, True)
         self.kn_graph.customized(
-            [draft_token_ids, argmax_out, tokens_buffer, accept_hist,
+            [argmax_out, tokens_buffer, accept_hist,
              new_token_nums, accepted_count_out],
             tb_graph)
         self.kn_graph.register_task(tb_graph, "mtp_verify_commit", params)
@@ -2450,31 +2451,37 @@ class PersistentKernel:
             [verify_hidden, accepted_count, extend_seed], tb_graph)
         self.kn_graph.register_task(tb_graph, "hidden_gather_accepted", params)
 
-    def mtp_snapshot_drafts_layer(
+    def mtp_draft_token_copy_layer(
         self,
         all_draft_ids: DTensor,  # (mbt, K) int64 — this iter's draft chains
-        drafts_prev: DTensor,    # (MAX_REQ, K) int64 — attach_input snapshot OUT
+        accepted_count: DTensor, # (1,) int32 — in-graph from verify_commit
+        tokens_buffer: DTensor,  # (MAX_REQ, MAX_SEQ_LEN) int64 — write-thru OUT
         grid_dim: tuple,
         block_dim: tuple,
         num_draft_tokens: int,   # K
-        mbt: int,
+        max_seq_len: int,
     ):
-        """Snapshot this iter's draft chain (all_draft_ids row-0) into the
-        drafts_prev attach_input for next iter's mtp_verify_commit (PR2).
+        """Copy this iter's draft chain (all_draft_ids row-0) into the global
+        token buffer at tokens[step+ac+1..step+ac+K], for next iter's verify
+        (forward input + accept-walk) (PR2).
 
-        drafts_prev MUST be an attach_input (non-edge) so the cross-iter read by
-        the next iter's verify is carried by the iteration barrier, not a tracked
-        edge (BL-20260530). all_draft_ids is the extend's scatter output (edge).
+        tokens_buffer MUST be an attach_input (non-edge) so the cross-iter read
+        by next iter's verify is carried by the iteration barrier, not a tracked
+        edge (BL-20260530/BL-20260610). all_draft_ids is the extend's scatter
+        output (edge); accepted_count is the in-graph ac from verify_commit.
 
-        Order matches register_mtp_snapshot_drafts_task codegen:
-          input_ptrs[0]=all_draft_ids ; output_ptrs[0]=drafts_prev.
+        Order matches register_mtp_draft_token_copy_task codegen:
+          input_ptrs[0]=all_draft_ids, [1]=accepted_count ;
+          output_ptrs[0]=tokens_buffer. (step read from runtime_config.)
         """
-        params = [num_draft_tokens, mbt]
+        params = [num_draft_tokens, max_seq_len]
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         tb_graph.new_input(all_draft_ids, (-1, -1, -1), -1, True)
-        tb_graph.new_input(drafts_prev, (-1, -1, -1), -1, True)
-        self.kn_graph.customized([all_draft_ids, drafts_prev], tb_graph)
-        self.kn_graph.register_task(tb_graph, "mtp_snapshot_drafts", params)
+        tb_graph.new_input(accepted_count, (-1, -1, -1), -1, True)
+        tb_graph.new_input(tokens_buffer, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [all_draft_ids, accepted_count, tokens_buffer], tb_graph)
+        self.kn_graph.register_task(tb_graph, "mtp_draft_token_copy", params)
 
     def eagle3_d2t_remap_layer(
         self,
