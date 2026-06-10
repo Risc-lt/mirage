@@ -342,13 +342,11 @@ class Eagle3Builder:
     ):
         """Register the Eagle3 draft loop tasks on self.mpk's graph.
 
-        Uses MPK's paged_attention_layer:
-          - K=1: writes mbt K/Vs at [step, step+mbt)
-          - K>1: passes q_len_override=1 + tail_offset=K-1-step so step k
-            writes exactly 1 K/V at absolute position [step+k]. The K draft
-            steps are serialized through the natural compute chain (step k+1
-            embeds step k's d2t-remapped token), so each step's attention
-            sees all prior steps' K/V writes via release/acquire fences.
+        LEGACY path (retained for K=1 bit-stability comparison). Uses MPK's
+        paged_attention_layer with NO override params (Q_LEN_OVERRIDE/TAIL_OFFSET
+        were removed in PR2). K=1 writes mbt K/Vs at [step, step+mbt). The K>1
+        sequential-chain trick that previously used q_len_override=1/tail_offset
+        is superseded by build_draft_extend's per-step draft mapping.
 
         Inputs are kernel-level DTensors produced earlier in the target graph.
         After this returns, self.all_draft_ids contains the K draft tokens per
@@ -415,34 +413,23 @@ class Eagle3Builder:
                 block_dim=bd_small,
             )
 
-            if K == 1:
-                self.mpk.paged_attention_layer(
-                    input=self.attn_in,
-                    k_cache=self.k_cache, v_cache=self.v_cache,
-                    q_norm=self.dummy_norm, k_norm=self.dummy_norm,
-                    cos_pos_embed=self.cos_pos_embed,
-                    sin_pos_embed=self.sin_pos_embed,
-                    output=self.attn_out,
-                    grid_dim=(self.mpk.max_num_batched_requests,
-                              self.num_kv_heads, 1),
-                    block_dim=bd_small,
-                    enable_qk_norm=False,
-                )
-            else:
-                self.mpk.paged_attention_layer(
-                    input=self.attn_in,
-                    k_cache=self.k_cache, v_cache=self.v_cache,
-                    q_norm=self.dummy_norm, k_norm=self.dummy_norm,
-                    cos_pos_embed=self.cos_pos_embed,
-                    sin_pos_embed=self.sin_pos_embed,
-                    output=self.attn_out,
-                    grid_dim=(self.mpk.max_num_batched_requests,
-                              self.num_kv_heads, 1),
-                    block_dim=bd_small,
-                    enable_qk_norm=False,
-                    q_len_override=1,
-                    tail_offset=K - step,
-                )
+            # PR2: Q_LEN_OVERRIDE/TAIL_OFFSET removed. K=1 was always the
+            # no-override call; the K>1 sequential-chain trick is superseded by
+            # build_draft_extend's per-step draft mapping. Collapses to the
+            # plain no-override attention (legacy path, retained for the K=1
+            # bit-stability comparison).
+            self.mpk.paged_attention_layer(
+                input=self.attn_in,
+                k_cache=self.k_cache, v_cache=self.v_cache,
+                q_norm=self.dummy_norm, k_norm=self.dummy_norm,
+                cos_pos_embed=self.cos_pos_embed,
+                sin_pos_embed=self.sin_pos_embed,
+                output=self.attn_out,
+                grid_dim=(self.mpk.max_num_batched_requests,
+                          self.num_kv_heads, 1),
+                block_dim=bd_small,
+                enable_qk_norm=False,
+            )
 
             self.mpk.linear_with_residual_layer(
                 input=self.attn_out, weight=self.w_o,

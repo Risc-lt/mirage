@@ -1911,9 +1911,7 @@ int TaskRegister::register_paged_attention_sm100_task(
   // params[3]: rotary_emd
   // params[4]: max_seq_len
   // params[5]: page_size
-  // params[6]: q_len_override (optional, default 0)
-  // params[7]: tail_offset    (optional, default 0)
-  assert(params.size() == 6 || params.size() == 8);
+  assert(params.size() == 6);
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
   int num_inputs = 7;
@@ -1938,8 +1936,6 @@ int TaskRegister::register_paged_attention_sm100_task(
   int kv_stride = head_dim * num_kv_heads;
   int max_seq_len = params[4];
   int page_size = params[5];
-  int q_len_override = (params.size() >= 7) ? params[6] : 0;
-  int tail_offset = (params.size() >= 8) ? params[7] : 0;
   // Assert that k_cache has the same head_dim
   assert(input_ops[1]->output_tensors[0].num_dims == 4);
   assert(head_dim == input_ops[1]->output_tensors[0].dim[3]);
@@ -1948,10 +1944,11 @@ int TaskRegister::register_paged_attention_sm100_task(
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  // Pass Q_LEN_OVERRIDE, TAIL_OFFSET, and MAX_TOKENS explicitly.
+  // Pass MAX_TOKENS explicitly (Q_LEN_OVERRIDE/TAIL_OFFSET removed: the draft
+  // now uses its own per-step mapping; num_tokens/seq_len derive from indptr).
   code.e("kernel::multitoken_paged_attention_sm100_task_impl<bfloat16, $, $, "
          "$, $, "
-         "$, $, $, $, $, $, $>(",
+         "$, $, $, $, $>(",
          num_q_heads / num_kv_heads,
          1,
          kv_stride,
@@ -1960,8 +1957,6 @@ int TaskRegister::register_paged_attention_sm100_task(
          head_dim,
          max_seq_len,
          page_size,
-         q_len_override,
-         tail_offset,
          max_tokens);
   code.e("    task_desc->input_ptrs[0],");
   code.e("    task_desc->input_ptrs[1],");

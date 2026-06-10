@@ -805,8 +805,6 @@ class PersistentKernel:
         grid_dim: tuple,
         block_dim: tuple,
         enable_qk_norm: bool = True,
-        q_len_override: int = 0,
-        tail_offset: int = 0,
     ):
         # Currently assume that input/output
         assert input.num_dims == 2  # (num_tokens, fused_outdim / world_size)
@@ -842,12 +840,10 @@ class PersistentKernel:
         # params[3]: rotary_embed
         # params[4]: max_seq_len
         # params[5]: page_size
-        # params[6]: q_len_override (only included if non-zero; for Eagle3 K>1 chain)
-        # params[7]: tail_offset    (only included if non-zero; for Eagle3 K>1 chain)
+        # (Q_LEN_OVERRIDE/TAIL_OFFSET removed in PR2: the draft uses its own
+        #  per-step mapping; num_tokens/seq_len derive purely from the indptr.)
         params = [num_q_heads, num_kv_heads, qk_norm, rotary_embed,
                   self.max_seq_length, self.page_size]
-        if q_len_override != 0 or tail_offset != 0:
-            params.extend([q_len_override, tail_offset])
 
         tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
         assert grid_dim[0] == self.max_num_batched_requests

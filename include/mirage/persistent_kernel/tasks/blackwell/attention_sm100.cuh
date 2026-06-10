@@ -40,8 +40,6 @@ template <typename T,
           int HEAD_DIM,
           int MAX_SEQ_LEN,
           int PAGE_SIZE,
-          int Q_LEN_OVERRIDE = 0,
-          int TAIL_OFFSET = 0,
           // MAX_TOKENS = per-call query rows (= mbt). Must be >= mbt yet small
           // enough that the per-row smem buffers fit MAX_DYNAMIC_SHARED_MEMORY.
           // The default 8 does NOT fit smem (MMA_ITERS_M 3->4, S_O_BUFFER
@@ -97,9 +95,7 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     if (first_token_pos == last_token_pos) {
       return;
     }
-    int const num_tokens = (Q_LEN_OVERRIDE > 0)
-                               ? Q_LEN_OVERRIDE
-                               : (last_token_pos - first_token_pos);
+    int const num_tokens = last_token_pos - first_token_pos;
 
     // NOTE(Jinchen): to simplify the implementation, we assume that the
     // metadata of the paged KV cache includes the new tokens, i.e., spaces are
@@ -109,8 +105,7 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     int const last_page_pos = paged_kv_indptr_buffer_ptr[request_id + 1];
     int const num_pages = last_page_pos - first_page_pos;
     int const seq_len = (num_pages - 1) * PAGE_SIZE +
-                        paged_kv_last_page_len_buffer_ptr[request_id] -
-                        TAIL_OFFSET;
+                        paged_kv_last_page_len_buffer_ptr[request_id];
     // valid_lens = [seq_len - num_tokens + 1 + i for i in range(num_tokens)]
 
     // Page indices are read directly from global memory (L2-cached)
