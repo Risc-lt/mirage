@@ -18,7 +18,12 @@ from transformers import AutoTokenizer
 # Must match demo/qwen3/demo_30B_A3B_eagle3.py
 PROMPT = "Give me a short introduction to large language model."
 TARGET = "Qwen/Qwen3-30B-A3B"
-DRAFT = "lmsys/SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-SpecForge-Nex"
+# RedHatAI speculators-format eagle3 draft (published per-K accept lengths).
+# NOTE: sglang is only the accept-length parity cross-check, NOT the correctness
+# gate (BL-20260609). If sglang cannot load the speculators format, pass the
+# SpecForge draft via --draft for the parity number; the MPK correctness gate
+# (MPK-spec ⊆ MPK-target-greedy) does not depend on sglang.
+DRAFT = "RedHatAI/Qwen3-30B-A3B-Instruct-2507-speculator.eagle3"
 
 
 def main():

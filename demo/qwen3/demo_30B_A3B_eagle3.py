@@ -101,8 +101,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--eagle3-draft-path", type=str,
-        default="lmsys/SGLang-EAGLE3-Qwen3-30B-A3B-Instruct-2507-SpecForge-Nex",
-        help="HF repo or local path for the Eagle3 draft model",
+        default="/raid/catalyst/models/RedHatAI-Qwen3-30B-A3B-speculator-eagle3",
+        help="HF repo or local path for the Eagle3 draft model. Default is the "
+             "RedHatAI speculators-format draft (published per-K accept lengths; "
+             "loaded via the speculators adapter in eagle3/builder.py).",
     )
     parser.add_argument(
         "--num-draft-steps", type=int, default=4,
