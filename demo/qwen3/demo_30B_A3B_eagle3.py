@@ -831,65 +831,90 @@ if __name__ == "__main__":
                 name="eagle3_drafts_prev",
             )
 
-            # Unified Eagle3 draft path: verify_strict registers first (its
-            # accepted_count is wired into the draft loop even though the K=1
-            # path's attention kernel doesn't consume ac yet — keeps the API
-            # ready for the K>1 decode-chain extension). The draft attention
-            # is the new flat-cache `eagle3_draft_chain_step_attn` kernel with
-            # NUM_TOKENS=mbt, USE_AC_OFFSET=False — writes mbt KV at positions
-            # [step, step+mbt-1] every iter, naturally covering prefill and
-            # decode through the "N tokens in → N KV writes out" contract.
-            # K>1 prefill (NUM_TOKENS=K+1 > 2 with NUM_Q_PER_KV=8) is gated by
-            # a static_assert in the kernel until the MMA m-loop extension.
-            mpk.mtp_verify_strict_layer(
-                draft_token_ids=eagle3_drafts_prev,
-                target_token_ids=argmax_out,
-                accepted_count=accepted_count,
-                output_tokens=verified_output,
-                grid_dim=(mbt_e, 1, 1),
-                block_dim=(128, 1, 1),
-                num_draft_tokens=K,
-            )
-            eagle3.build_draft_loop(
-                aux_h0=eagle3_aux_h0,
-                aux_h1=eagle3_aux_h1,
-                aux_h2=eagle3_aux_h2,
-                target_argmax_token=argmax_out,
-                accepted_count=accepted_count,
-            )
-
-            # Single-edge-per-pair design: pass argmax_out (from argmax_reduce)
-            # instead of verified_output (from verify_strict, which also
-            # produces accepted_count). commit also snapshots drafts_new into
-            # the attach_input drafts_prev buffer (for next iter's verify).
+            # Shared attach_inputs for both the legacy and draft-extend paths.
             d_tokens = mpk.attach_input(
                 torch_tensor=tokens, name="eagle3_commit_tokens")
             d_num_new = mpk.attach_input(
                 torch_tensor=num_new_tokens, name="eagle3_commit_num_new")
             # Debug: per-iter accept-rate histogram (bin 0 reserved; bins 1..K+1
-            # hold counts for ac=1..K+1) + trace tail. Layout:
-            #   [0..K+1]: histogram bins
-            #   [K+2]:    trace counter (atomicAdd writer index)
-            #   [K+3..]:  per-iter records of size 2K+2 ints:
-            #             (ac, argmax[0..K], old_drafts_prev[0..K-1])
-            # Capped at 16 iters in the kernel. Sized to 256 ints for headroom.
+            # hold counts for ac=1..K+1) + trace tail. Sized to 256 ints.
             accept_hist_buf = torch.zeros(256, dtype=torch.int32, device="cuda")
             d_accept_hist = mpk.attach_input(
                 torch_tensor=accept_hist_buf, name="eagle3_accept_hist")
-            mpk.eagle3_commit_layer(
-                target_argmax=argmax_out,
-                draft_tokens_new=eagle3._attach_cache["eagle3_all_draft_ids"],
-                accepted_count=accepted_count,
-                tokens_buffer=d_tokens,
-                num_new_tokens=d_num_new,
-                drafts_prev=eagle3_drafts_prev,
-                accept_hist=d_accept_hist,
-                grid_dim=(mpk.max_num_batched_requests, 1, 1),
-                block_dim=(128, 1, 1),
-                num_draft_tokens=K,
-                batch_size=mbt_e,  # all_draft_ids is (mbt, K) — unified path
-                max_seq_len=args.max_seq_length,
-            )
+
+            use_draft_extend = os.environ.get("MPK_DRAFT_EXTEND", "0") == "1"
+            if use_draft_extend:
+                # PR2 draft-extend pipeline (sglang-style):
+                #   mtp_verify_commit (reads prev-iter drafts_prev, writes
+                #     accepted_count + confirmed tokens + new_token_nums)
+                #   → prepare_draft_input (gather target hidden at accepted rows
+                #     → eh/fc projection → extend_seed_hidden)
+                #   → build_draft_extend (draft prefill on the prepared seed,
+                #     GQA attention over the draft mapping → all_draft_ids)
+                #   → mtp_snapshot_drafts (all_draft_ids → drafts_prev for the
+                #     NEXT iter's verify; drafts_prev stays an attach_input so the
+                #     cross-iter read rides the iteration barrier, BL-20260530).
+                eagle3._prepare_weights()
+                eagle3._attach_weights()
+                eagle3._allocate_intermediates()
+                mpk.mtp_verify_commit_layer(
+                    draft_token_ids=eagle3_drafts_prev,
+                    argmax_out=argmax_out,
+                    tokens_buffer=d_tokens,
+                    accept_hist=d_accept_hist,
+                    new_token_nums=d_num_new,
+                    accepted_count_out=accepted_count,
+                    grid_dim=(mbt_e, 1, 1),
+                    block_dim=(128, 1, 1),
+                    num_draft_tokens=K,
+                    max_seq_len=args.max_seq_length,
+                )
+                eagle3.prepare_draft_input(
+                    aux_h0=eagle3_aux_h0, aux_h1=eagle3_aux_h1,
+                    aux_h2=eagle3_aux_h2, accepted_count=accepted_count,
+                )
+                eagle3.build_draft_extend(
+                    seed_token=argmax_out, accepted_count=accepted_count,
+                )
+                mpk.mtp_snapshot_drafts_layer(
+                    all_draft_ids=eagle3._attach_cache["eagle3_all_draft_ids"],
+                    drafts_prev=eagle3_drafts_prev,
+                    grid_dim=(1, 1, 1), block_dim=(128, 1, 1),
+                    num_draft_tokens=K, mbt=mbt_e,
+                )
+            else:
+                # Legacy path (verify_strict → build_draft_loop → eagle3_commit),
+                # retained for K=1 bit-stability comparison.
+                mpk.mtp_verify_strict_layer(
+                    draft_token_ids=eagle3_drafts_prev,
+                    target_token_ids=argmax_out,
+                    accepted_count=accepted_count,
+                    output_tokens=verified_output,
+                    grid_dim=(mbt_e, 1, 1),
+                    block_dim=(128, 1, 1),
+                    num_draft_tokens=K,
+                )
+                eagle3.build_draft_loop(
+                    aux_h0=eagle3_aux_h0,
+                    aux_h1=eagle3_aux_h1,
+                    aux_h2=eagle3_aux_h2,
+                    target_argmax_token=argmax_out,
+                    accepted_count=accepted_count,
+                )
+                mpk.eagle3_commit_layer(
+                    target_argmax=argmax_out,
+                    draft_tokens_new=eagle3._attach_cache["eagle3_all_draft_ids"],
+                    accepted_count=accepted_count,
+                    tokens_buffer=d_tokens,
+                    num_new_tokens=d_num_new,
+                    drafts_prev=eagle3_drafts_prev,
+                    accept_hist=d_accept_hist,
+                    grid_dim=(mpk.max_num_batched_requests, 1, 1),
+                    block_dim=(128, 1, 1),
+                    num_draft_tokens=K,
+                    batch_size=mbt_e,  # all_draft_ids is (mbt, K) — unified path
+                    max_seq_len=args.max_seq_length,
+                )
         elif spec_decode_config:
             verify_out = mpk.verify_layer_dispatcher(
                 spec_decode_config = spec_decode_config,
