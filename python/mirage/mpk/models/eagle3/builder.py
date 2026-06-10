@@ -31,6 +31,51 @@ def _load_draft_state_dict(path: str) -> dict:
     return state_dict
 
 
+def _is_speculators_format(config: dict) -> bool:
+    """RedHatAI/speculators-library eagle3 checkpoints use a different layout
+    than the SpecForge `midlayer.`-prefixed format MPK's builder expects."""
+    return (config.get("speculators_model_type") == "eagle3"
+            or "speculators_config" in config
+            or "transformer_layer_config" in config)
+
+
+def _adapt_speculators_eagle3(state_dict: dict, config: dict):
+    """Convert a speculators-library eagle3 checkpoint (e.g.
+    RedHatAI/Qwen3-30B-A3B-Instruct-2507-speculator.eagle3) into the
+    (`midlayer.`-prefixed state_dict, flat config) form Eagle3Builder expects.
+
+    Key remap: the single transformer layer is stored under `layers.0.` in the
+    speculators format vs `midlayer.` in SpecForge. Top-level tensors
+    (fc.weight, d2t, lm_head.weight, norm.weight) keep their names. The draft's
+    own `embed_tokens.weight` and `t2d` are unused by MPK (the target embedding
+    is shared via target_w_embed; only d2t is needed) and are dropped.
+
+    Config flatten: dims live under `transformer_layer_config`; draft_vocab_size
+    is top-level. Lift to the flat keys the builder reads.
+    """
+    # --- state_dict key remap ---
+    new_sd = {}
+    for k, v in state_dict.items():
+        if k.startswith("layers.0."):
+            new_sd["midlayer." + k[len("layers.0."):]] = v
+        elif k in ("embed_tokens.weight", "t2d"):
+            continue  # unused by MPK
+        else:
+            new_sd[k] = v  # fc.weight, d2t, lm_head.weight, norm.weight
+
+    # --- config flatten ---
+    tlc = config.get("transformer_layer_config", {})
+    flat = dict(config)
+    for key in ("hidden_size", "intermediate_size", "num_attention_heads",
+                "num_key_value_heads", "head_dim", "rms_norm_eps"):
+        if key in tlc:
+            flat[key] = tlc[key]
+    # draft_vocab_size is already top-level in the speculators config.
+    assert "draft_vocab_size" in flat, (
+        "speculators eagle3 config missing draft_vocab_size")
+    return new_sd, flat
+
+
 class Eagle3Builder:
     """Build the Eagle3 draft + verify portion of a target model's task graph.
 
@@ -152,14 +197,26 @@ class Eagle3Builder:
         self._fc_w = fc.contiguous()
         self._kept_tensors.append(self._fc_w)
 
-        # lm_head. Eagle3 uses hot vocab head; size 32000.
-        # Pad rows to make per-task output 16B-aligned so cuTensorMapEncodeTiled
-        # accepts the OUTPUT TMA descriptor. 32000 → 32256 (= 96 × 336 elements);
+        # lm_head. Eagle3 uses a hot vocab head (32000 for SpecForge, 64000 for
+        # the RedHatAI speculator). The padded row count must match the
+        # lm_head linear's output-task grid rule (grid_for_rmsnorm_linear_layer):
+        #   - size/96 <= 400 (e.g. 32000): pad to a 96-multiple → 32256 (=96*336),
+        #     making the per-task output 16B-aligned for cuTensorMapEncodeTiled.
+        #   - size/96 > 400 (e.g. 64000): the large-output path requires
+        #     size % 256 == 0 and tiles by 256; 64000 = 256*250 is already
+        #     aligned, so no padding is needed.
         lm = sd["lm_head.weight"]
         assert lm.shape == (self.draft_vocab_size, self.hidden_size)
-        self._padded_draft_vocab = 32256
-        assert self._padded_draft_vocab % 96 == 0, (
-            f"padded_draft_vocab {self._padded_draft_vocab} must be 96-aligned")
+        if self.draft_vocab_size / 96 > 400:
+            assert self.draft_vocab_size % 256 == 0, (
+                f"large draft_vocab_size {self.draft_vocab_size} must be "
+                f"256-aligned for the linear large-output path")
+            self._padded_draft_vocab = self.draft_vocab_size
+        else:
+            self._padded_draft_vocab = 32256
+            assert self._padded_draft_vocab % 96 == 0, (
+                f"padded_draft_vocab {self._padded_draft_vocab} must be "
+                f"96-aligned")
         pad_rows = self._padded_draft_vocab - self.draft_vocab_size
         if pad_rows > 0:
             self._lm_head_w = torch.cat(
@@ -458,4 +515,6 @@ def load_eagle3_draft(draft_model_path_or_repo: str):
     with open(os.path.join(path, "config.json")) as fp:
         config = json.load(fp)
     state_dict = _load_draft_state_dict(path)
+    if _is_speculators_format(config):
+        state_dict, config = _adapt_speculators_eagle3(state_dict, config)
     return state_dict, config
