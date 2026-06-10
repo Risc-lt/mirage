@@ -198,6 +198,12 @@ enum TaskType {
   TASK_MTP_BUILD_EMBED_INPUT = 294,
   // MLA prefill TP=8: unabsorbed, TMA K/V, seq_len<=4096.
   TASK_MLA_PREFILL_TP8_SM100 = 295,
+  // Merged verify+commit for the draft-extend path (PR2): strict accept-walk +
+  // confirmed-token write + new_token_nums + in-graph accepted_count_out.
+  TASK_MTP_VERIFY_COMMIT = 296,
+  // Gather target verify-hidden rows [0..accepted_count-1] into the
+  // draft-extend seed buffer (PR2).
+  TASK_HIDDEN_GATHER_ACCEPTED = 297,
   TASK_SM100_TASK_END = 298, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,

@@ -314,4 +314,114 @@ __device__ __forceinline__ void
   }
 }
 
+// --- MTP Verify + Commit (merged; draft-extend design, PR2) ---
+//
+// Replaces the (verify_strict → eagle3_commit) pair on the draft-extend path.
+// Folds the strict accept-walk and the token-buffer commit into ONE kernel and
+// — crucially — DROPS the `src_slot` selection of `draft_tokens_new`. In the
+// draft-extend design the next iteration's draft chain is NOT a slot of this
+// iteration's parallel-branch output; it is produced by the extend stage
+// (`_build_draft_extend`), which re-seeds the draft from the confirmed tokens +
+// the target hidden at the accepted positions. So this kernel's only jobs are:
+//
+//   1. Strict accept-walk: compare draft_token_ids[0..K-1] vs the target's
+//      argmax[0..K-1]; accept the matching prefix; accepted_count = (#accepted)
+//      + 1 for the bonus token (lies in [1, K+1]).
+//   2. Write the confirmed tokens (= target argmax over the accepted prefix +
+//      bonus) into tokens_buffer at [step+1 .. step+accepted_count], guarded
+//      against overwriting the prompt.
+//   3. Publish accepted_count to new_token_nums[req] (scheduler-contract field;
+//      the OFFLINE runtime's prepare_next_batch advances target step by it).
+//   4. Publish accepted_count to the in-graph `accepted_count_out` consumed by
+//      hidden_gather_accepted + the draft extend builder (this iteration).
+//
+// It does NOT write next-iter drafts and does NOT read any draft slot beyond
+// the accept-walk comparison, so accept-0 reads no rejected draft slot (AC-9).
+//
+// Pluggable acceptance: AcceptPolicy is a compile-time selector. STRICT_GREEDY
+// is the only policy implemented here (the probabilistic path stays standalone
+// per the path boundaries); the enum is the seam for future policies.
+//
+// Inputs:
+//   draft_token_ids   [K]                    int64 — this iter's draft chain
+//   argmax_out        [K+1]                  int64 — target argmax (K+1 pos)
+//   step              [MAX_REQ]              int32 — current confirmed length
+//   prompt_length     [MAX_REQ]              int32 — req's prompt length
+// Outputs:
+//   tokens_buffer     [MAX_REQ, MAX_SEQ_LEN] int64 — confirmed-token write
+//   new_token_nums    [MAX_REQ]              int32 — accepted_count for runtime
+//   accepted_count_out[1]                    int32 — in-graph accepted_count
+//   accept_hist       [..]                   int32 — optional instrumentation
+enum class AcceptPolicy { STRICT_GREEDY = 0 };
+
+template <int K,
+          int MAX_SEQ_LEN,
+          AcceptPolicy POLICY = AcceptPolicy::STRICT_GREEDY>
+__device__ __forceinline__ void
+    mtp_verify_commit_kernel(void const *__restrict__ draft_token_ids_ptr,
+                             void const *__restrict__ argmax_out_ptr,
+                             void const *__restrict__ step_ptr,
+                             void const *__restrict__ prompt_length_ptr,
+                             void *__restrict__ tokens_buffer_ptr,
+                             void *__restrict__ new_token_nums_ptr,
+                             void *__restrict__ accepted_count_out_ptr,
+                             void *__restrict__ accept_hist_ptr,
+                             int request_id) {
+  static_assert(POLICY == AcceptPolicy::STRICT_GREEDY,
+                "mtp_verify_commit: only STRICT_GREEDY implemented in PR2");
+
+  long long const *__restrict__ draft_ids =
+      static_cast<long long const *>(draft_token_ids_ptr);
+  long long const *__restrict__ argmax =
+      static_cast<long long const *>(argmax_out_ptr);
+  int const *__restrict__ step = static_cast<int const *>(step_ptr);
+  int const *__restrict__ prompt_length =
+      static_cast<int const *>(prompt_length_ptr);
+  long long *__restrict__ tokens = static_cast<long long *>(tokens_buffer_ptr);
+  int *__restrict__ new_token_nums = static_cast<int *>(new_token_nums_ptr);
+  int *__restrict__ accepted_count_out =
+      static_cast<int *>(accepted_count_out_ptr);
+
+  int t_id = threadIdx.x;
+  int req = request_id;
+
+  // 1. Strict accept-walk (single-thread; K is tiny so no need to parallelize).
+  __shared__ int ac_smem;
+  if (t_id == 0) {
+    int accepted = K;
+    for (int i = 0; i < K; i++) {
+      if (draft_ids[i] != argmax[i]) {
+        accepted = i;
+        break;
+      }
+    }
+    ac_smem = accepted + 1; // +1 bonus token; in [1, K+1]
+  }
+  __syncthreads();
+  int ac = ac_smem;
+
+  int cur_step = step[req];
+  int prompt_len = prompt_length[req];
+
+  // 2. Write confirmed tokens at step+1 .. step+ac (only past prompt). Values
+  //    come from the target argmax over the accepted prefix + bonus.
+  if (t_id < ac) {
+    int pos = cur_step + 1 + t_id;
+    if (pos < MAX_SEQ_LEN && pos >= prompt_len) {
+      tokens[req * MAX_SEQ_LEN + pos] = argmax[t_id];
+    }
+  }
+
+  // 3/4. Publish accepted_count to the runtime (scheduler-contract) and to the
+  //      in-graph consumers (hidden_gather_accepted + draft extend).
+  if (t_id == 0) {
+    new_token_nums[req] = ac;
+    accepted_count_out[0] = ac;
+    if (accept_hist_ptr != nullptr) {
+      int *hist = static_cast<int *>(accept_hist_ptr);
+      atomicAdd(&hist[ac], 1);
+    }
+  }
+}
+
 } // namespace kernel

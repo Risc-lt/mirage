@@ -4483,6 +4483,49 @@ int TaskRegister::register_eagle3_commit_task(threadblock::Graph const &bgraph,
   return register_task_variant(TASK_EAGLE3_COMMIT, code.to_string());
 }
 
+int TaskRegister::register_mtp_verify_commit_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: K (= num_draft_steps), params[1]: max_seq_len
+  // Merged verify+commit for the draft-extend path. Inputs: draft_token_ids,
+  // argmax_out, tokens_buffer (write-through), accept_hist (attach_input).
+  // Outputs: new_token_nums, accepted_count_out. step/prompt_length are
+  // globals.
+  assert(params.size() == 2);
+  int K = params[0];
+  int max_seq_len = params[1];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mtp_verify_commit_kernel<$, $>(", K, max_seq_len);
+  code.e("    task_desc->input_ptrs[0],");     // draft_token_ids
+  code.e("    task_desc->input_ptrs[1],");     // argmax_out (K+1)
+  code.e("    runtime_config.step,");          // step (global)
+  code.e("    runtime_config.prompt_length,"); // prompt_length (global)
+  code.e("    task_desc->input_ptrs[2],");     // tokens_buffer (write-thru)
+  code.e("    task_desc->output_ptrs[0],");    // new_token_nums
+  code.e("    task_desc->output_ptrs[1],");    // accepted_count_out
+  code.e("    task_desc->input_ptrs[3],");     // accept_hist (attach_input)
+  code.e("    task_desc->task_metadata.request_id);"); // request_id
+  return register_task_variant(TASK_MTP_VERIFY_COMMIT, code.to_string());
+}
+
+int TaskRegister::register_hidden_gather_accepted_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: K (= num_draft_steps), params[1]: hidden_dim
+  assert(params.size() == 2);
+  int K = params[0];
+  int hidden_dim = params[1];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e(
+      "kernel::hidden_gather_accepted_kernel<bfloat16, $, $>(", K, hidden_dim);
+  code.e("    task_desc->input_ptrs[0],");   // verify_hidden [K+1, H]
+  code.e("    task_desc->input_ptrs[1],");   // accepted_count (in-graph)
+  code.e("    task_desc->output_ptrs[0]);"); // extend_seed [K+1, H]
+  return register_task_variant(TASK_HIDDEN_GATHER_ACCEPTED, code.to_string());
+}
+
 // ============ MLA-MTP TP variants (ferret-derived, no-PDL) ============
 //
 // Three variants (TP=2/4/8) share structure but differ:

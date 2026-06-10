@@ -252,4 +252,51 @@ __device__ __forceinline__ void mtp_build_draft_indptr_kernel(
   }
 }
 
+// --- Hidden Gather Accepted (draft-extend seed, PR2) ---
+//
+// Selects the target verify-hidden rows at the ACCEPTED positions
+// (rows 0..accepted_count-1) into a contiguous [accepted_count, H] seed buffer
+// consumed by `_build_draft_extend`. accepted_count comes in-graph from
+// mtp_verify_commit and lies in [1, K+1] (always >=1 because of the bonus
+// token), so the gather always copies at least the bonus position and NEVER
+// reads a rejected draft slot (rows >= accepted_count are zero-filled, not read
+// from the draft) — satisfying the AC-9 accept-0 invariant by construction.
+//
+// Grid: (K+1, 1, 1) — one block per potential row; block copies H elements.
+// Inputs:
+//   verify_hidden:    [K+1, H]  bf16 — target hidden at the K+1 verify
+//   positions accepted_count:   [1]       int32 — from mtp_verify_commit
+//   (in-graph)
+// Outputs:
+//   extend_seed:      [K+1, H]  bf16 — rows [0..ac-1] = verify_hidden; rest = 0
+template <typename T, int NUM_DRAFT, int HIDDEN_DIM>
+__device__ __forceinline__ void
+    hidden_gather_accepted_kernel(void const *__restrict__ verify_hidden_ptr,
+                                  void const *__restrict__ accepted_count_ptr,
+                                  void *__restrict__ extend_seed_ptr) {
+  T const *__restrict__ verify_hidden =
+      static_cast<T const *>(verify_hidden_ptr);
+  int const *__restrict__ accepted_count =
+      static_cast<int const *>(accepted_count_ptr);
+  T *__restrict__ extend_seed = static_cast<T *>(extend_seed_ptr);
+
+  int row = blockIdx.x; // 0 .. NUM_DRAFT (K+1 rows total)
+  if (row > NUM_DRAFT) {
+    return;
+  }
+  int ac = accepted_count[0]; // in [1, NUM_DRAFT+1]
+
+  if (row < ac) {
+    // Copy verify_hidden[row, :] -> extend_seed[row, :]
+    for (int c = threadIdx.x; c < HIDDEN_DIM; c += blockDim.x) {
+      extend_seed[row * HIDDEN_DIM + c] = verify_hidden[row * HIDDEN_DIM + c];
+    }
+  } else {
+    // Zero-fill rows beyond the accepted prefix (never read from the draft).
+    for (int c = threadIdx.x; c < HIDDEN_DIM; c += blockDim.x) {
+      extend_seed[row * HIDDEN_DIM + c] = static_cast<T>(0.0f);
+    }
+  }
+}
+
 } // namespace kernel

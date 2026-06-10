@@ -2419,6 +2419,71 @@ class PersistentKernel:
             tb_graph)
         self.kn_graph.register_task(tb_graph, "eagle3_commit", params)
 
+    def mtp_verify_commit_layer(
+        self,
+        draft_token_ids: DTensor,   # (K,) int64 — this iter's draft chain
+        argmax_out: DTensor,        # (K+1,) int64 — target argmax over K+1 pos
+        tokens_buffer: DTensor,     # (max_requests, max_seq_len) int64 — write-thru
+        accept_hist: DTensor,       # (K+2,) int32 — debug histogram
+        new_token_nums: DTensor,    # (max_requests,) int32 — OUTPUT (= accept_count)
+        accepted_count_out: DTensor,# (1,) int32 — OUTPUT in-graph accepted_count
+        grid_dim: tuple,
+        block_dim: tuple,
+        num_draft_tokens: int,      # K
+        max_seq_len: int,
+    ):
+        """Merged verify+commit for the draft-extend path (PR2).
+
+        Strict accept-walk + confirmed-token write + new_token_nums + in-graph
+        accepted_count_out. Drops the eagle3_commit src_slot selection (the next
+        draft chain comes from the extend stage, not a slot).
+
+        Input/output order MUST match register_mtp_verify_commit_task codegen:
+          input_ptrs[0]=draft_token_ids, [1]=argmax_out, [2]=tokens_buffer,
+          [3]=accept_hist ; output_ptrs[0]=new_token_nums, [1]=accepted_count_out.
+        (step/prompt_length are read from runtime_config, not task inputs.)
+        """
+        params = [num_draft_tokens, max_seq_len]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(draft_token_ids, (-1, -1, -1), -1, True)
+        tb_graph.new_input(argmax_out, (-1, -1, -1), -1, True)
+        tb_graph.new_input(tokens_buffer, (-1, -1, -1), -1, True)
+        tb_graph.new_input(accept_hist, (-1, -1, -1), -1, True)
+        tb_graph.new_input(new_token_nums, (-1, -1, -1), -1, True)
+        tb_graph.new_input(accepted_count_out, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [draft_token_ids, argmax_out, tokens_buffer, accept_hist,
+             new_token_nums, accepted_count_out],
+            tb_graph)
+        self.kn_graph.register_task(tb_graph, "mtp_verify_commit", params)
+
+    def hidden_gather_accepted_layer(
+        self,
+        verify_hidden: DTensor,     # (K+1, H) bf16 — target hidden at verify pos
+        accepted_count: DTensor,    # (1,) int32 — in-graph from verify_commit
+        extend_seed: DTensor,       # (K+1, H) bf16 — OUTPUT seed for draft extend
+        grid_dim: tuple,            # should be (K+1, 1, 1)
+        block_dim: tuple,
+        num_draft_tokens: int,      # K
+        hidden_dim: int,            # H
+    ):
+        """Gather target verify-hidden rows [0..accepted_count-1] into the
+        draft-extend seed (PR2). accepted_count >= 1 always (bonus token), so no
+        rejected draft slot is read.
+
+        Order MUST match register_hidden_gather_accepted_task codegen:
+          input_ptrs[0]=verify_hidden, [1]=accepted_count ;
+          output_ptrs[0]=extend_seed.
+        """
+        params = [num_draft_tokens, hidden_dim]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(verify_hidden, (-1, -1, -1), -1, True)
+        tb_graph.new_input(accepted_count, (-1, -1, -1), -1, True)
+        tb_graph.new_input(extend_seed, (-1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [verify_hidden, accepted_count, extend_seed], tb_graph)
+        self.kn_graph.register_task(tb_graph, "hidden_gather_accepted", params)
+
     def eagle3_d2t_remap_layer(
         self,
         hot_token: DTensor,      # (batch, 1) int64 — argmax over draft logits

@@ -856,6 +856,21 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // Outputs: new_token_nums, drafts_prev (cross-iter snapshot)
     // (step / prompt_length read from runtime_config)
     task_config[op] = std::make_tuple(5, 2, TASK_EAGLE3_COMMIT, variant_id);
+  } else if (name == "mtp_verify_commit") {
+    int variant_id = task_register->register_mtp_verify_commit_task(
+        customized->bgraph, params);
+    // Inputs:  draft_token_ids, argmax_out, tokens_buffer (write-through),
+    //          accept_hist (attach_input; debug)
+    // Outputs: new_token_nums, accepted_count_out
+    // (step / prompt_length read from runtime_config)
+    task_config[op] = std::make_tuple(4, 2, TASK_MTP_VERIFY_COMMIT, variant_id);
+  } else if (name == "hidden_gather_accepted") {
+    int variant_id = task_register->register_hidden_gather_accepted_task(
+        customized->bgraph, params);
+    // Inputs:  verify_hidden [K+1,H], accepted_count (in-graph)
+    // Outputs: extend_seed [K+1,H]
+    task_config[op] =
+        std::make_tuple(2, 1, TASK_HIDDEN_GATHER_ACCEPTED, variant_id);
   }
   // Multi-GPU tasks
   else if (name == "nvshmem_allgather_strided_put") {
