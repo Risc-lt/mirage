@@ -2480,6 +2480,32 @@ class PersistentKernel:
             [verify_hidden, accepted_count, extend_seed], tb_graph)
         self.kn_graph.register_task(tb_graph, "hidden_gather_accepted", params)
 
+    def mtp_snapshot_drafts_layer(
+        self,
+        all_draft_ids: DTensor,  # (mbt, K) int64 — this iter's draft chains
+        drafts_prev: DTensor,    # (MAX_REQ, K) int64 — attach_input snapshot OUT
+        grid_dim: tuple,
+        block_dim: tuple,
+        num_draft_tokens: int,   # K
+        mbt: int,
+    ):
+        """Snapshot this iter's draft chain (all_draft_ids row-0) into the
+        drafts_prev attach_input for next iter's mtp_verify_commit (PR2).
+
+        drafts_prev MUST be an attach_input (non-edge) so the cross-iter read by
+        the next iter's verify is carried by the iteration barrier, not a tracked
+        edge (BL-20260530). all_draft_ids is the extend's scatter output (edge).
+
+        Order matches register_mtp_snapshot_drafts_task codegen:
+          input_ptrs[0]=all_draft_ids ; output_ptrs[0]=drafts_prev.
+        """
+        params = [num_draft_tokens, mbt]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(all_draft_ids, (-1, -1, -1), -1, True)
+        tb_graph.new_input(drafts_prev, (-1, -1, -1), -1, True)
+        self.kn_graph.customized([all_draft_ids, drafts_prev], tb_graph)
+        self.kn_graph.register_task(tb_graph, "mtp_snapshot_drafts", params)
+
     def eagle3_d2t_remap_layer(
         self,
         hot_token: DTensor,      # (batch, 1) int64 — argmax over draft logits

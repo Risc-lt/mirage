@@ -871,6 +871,13 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     // Outputs: extend_seed [K+1,H]
     task_config[op] =
         std::make_tuple(2, 1, TASK_HIDDEN_GATHER_ACCEPTED, variant_id);
+  } else if (name == "mtp_snapshot_drafts") {
+    int variant_id = task_register->register_mtp_snapshot_drafts_task(
+        customized->bgraph, params);
+    // Inputs:  all_draft_ids [mbt,K] (scatter output edge)
+    // Outputs: drafts_prev [MAX_REQ,K] (attach_input, non-edge)
+    task_config[op] =
+        std::make_tuple(1, 1, TASK_MTP_SNAPSHOT_DRAFTS, variant_id);
   }
   // Multi-GPU tasks
   else if (name == "nvshmem_allgather_strided_put") {

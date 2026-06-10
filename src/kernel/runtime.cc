@@ -1809,6 +1809,7 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MTP_VERIFY_COMMIT] = "TASK_MTP_VERIFY_COMMIT";
   task_type_to_name[TASK_HIDDEN_GATHER_ACCEPTED] =
       "TASK_HIDDEN_GATHER_ACCEPTED";
+  task_type_to_name[TASK_MTP_SNAPSHOT_DRAFTS] = "TASK_MTP_SNAPSHOT_DRAFTS";
   task_type_to_name[TASK_QUANTIZE_FP8_SM100] = "TASK_QUANTIZE_FP8_SM100";
   task_type_to_name[TASK_LINEAR_FP8_SM100] = "TASK_LINEAR_FP8_SM100";
   task_type_to_name[TASK_LINEAR_FP8_WITH_RESIDUAL_SM100] =

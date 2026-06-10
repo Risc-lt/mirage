@@ -4521,6 +4521,21 @@ int TaskRegister::register_hidden_gather_accepted_task(
   return register_task_variant(TASK_HIDDEN_GATHER_ACCEPTED, code.to_string());
 }
 
+int TaskRegister::register_mtp_snapshot_drafts_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: K (= num_draft_steps), params[1]: mbt
+  assert(params.size() == 2);
+  int K = params[0];
+  int mbt = params[1];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mtp_snapshot_drafts_kernel<$, $>(", K, mbt);
+  code.e("    task_desc->input_ptrs[0],");   // all_draft_ids [mbt, K]
+  code.e("    task_desc->output_ptrs[0]);"); // drafts_prev [MAX_REQ, K]
+  return register_task_variant(TASK_MTP_SNAPSHOT_DRAFTS, code.to_string());
+}
+
 // ============ MLA-MTP TP variants (ferret-derived, no-PDL) ============
 //
 // Three variants (TP=2/4/8) share structure but differ:

@@ -196,6 +196,8 @@ public:
                                       std::vector<int> const &params);
   int register_hidden_gather_accepted_task(threadblock::Graph const &bgraph,
                                            std::vector<int> const &params);
+  int register_mtp_snapshot_drafts_task(threadblock::Graph const &bgraph,
+                                        std::vector<int> const &params);
   // SM100 tasks end
   // Multi-GPU tasks
   int register_nvshmem_allgather_strided_put_task(

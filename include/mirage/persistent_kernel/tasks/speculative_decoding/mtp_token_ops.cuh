@@ -299,4 +299,40 @@ __device__ __forceinline__ void
   }
 }
 
+// --- MTP Snapshot Drafts (cross-iter draft chain snapshot, PR2) ---
+//
+// Copies THIS iteration's draft chain (the row-0 chain of all_draft_ids,
+// [0..K-1]) into the `drafts_prev` attach_input buffer, so NEXT iteration's
+// mtp_verify_commit can compare its (previous) drafts against the target
+// argmax.
+//
+// Replaces the snapshot side-effect that eagle3_commit_kernel used to perform
+// (eagle3_ops.cuh:250-252), now that mtp_verify_commit (correctly) does not
+// write drafts_prev. Critical (BL-20260530): drafts_prev is an attach_input
+// (NOT a tracked graph edge); the iteration barrier carries iter N's value to
+// iter N+1's verify. This task reads all_draft_ids (a real producer edge from
+// the extend's final scatter) and writes drafts_prev (attach_input, non-edge),
+// so verify is NOT forced to wait for this iter's extend.
+//
+// Single linear chain per request ⇒ snapshot the row-0 chain.
+// Grid: (1, 1, 1).
+// Inputs:
+//   all_draft_ids: [mbt, K] int64 — this iter's draft chains (scatter output)
+// Outputs:
+//   drafts_prev:   [MAX_REQ, K] int64 — attach_input snapshot for next iter
+template <int K, int MBT>
+__device__ __forceinline__ void
+    mtp_snapshot_drafts_kernel(void const *__restrict__ all_draft_ids_ptr,
+                               void *__restrict__ drafts_prev_ptr) {
+  long long const *__restrict__ all_draft_ids =
+      static_cast<long long const *>(all_draft_ids_ptr);
+  long long *__restrict__ drafts_prev =
+      static_cast<long long *>(drafts_prev_ptr);
+  int t_id = threadIdx.x;
+  if (t_id < K) {
+    // Row-0 chain: all_draft_ids[0 * K + t_id].
+    drafts_prev[t_id] = all_draft_ids[t_id];
+  }
+}
+
 } // namespace kernel
