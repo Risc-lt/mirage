@@ -1978,6 +1978,87 @@ int TaskRegister::register_paged_attention_sm100_task(
   return register_task_variant(TASK_ATTN_SM100, code.to_string());
 }
 
+int TaskRegister::register_paged_attention_sm100_draft_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // PR3: identical to register_paged_attention_sm100_task EXCEPT it reads the
+  // DRAFT KV mapping (runtime_config.draft_qo_indptr_buffer / draft_paged_kv_*)
+  // instead of the global target mapping. This is the read-side fix for the
+  // accept-collapse: the draft must attend its own cache with the correct
+  // attend-range/seq_len + in-kernel rope offset, not the target's K+1
+  // geometry. params[6] = draft inner step s (compile-time DRAFT_STEP_S): s==0
+  // EXTEND (q_len=ac, seq_len=base); s>=1 DECODE (q_len=1, seq_len=base+s).
+  assert(params.size() == 7);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 7;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  int max_tokens = input_ops[0]->dtensor.dim[0];
+  int qkv_stride = input_ops[0]->dtensor.dim[1];
+  int output_size = output_ops[0]->dtensor.dim[1];
+  int num_q_heads = params[0];
+  int num_kv_heads = params[1];
+  int head_dim = output_size / num_q_heads;
+  int kv_stride = head_dim * num_kv_heads;
+  int max_seq_len = params[4];
+  int page_size = params[5];
+  int draft_step_s = params[6]; // compile-time DRAFT_STEP_S
+  assert(input_ops[1]->output_tensors[0].num_dims == 4);
+  assert(head_dim == input_ops[1]->output_tensors[0].dim[3]);
+  assert(input_ops[2]->output_tensors[0].num_dims == 4);
+  assert(head_dim == input_ops[2]->output_tensors[0].dim[3]);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  // Independent DRAFT entry: reads the draft mapping + draft_step (base) and
+  // the runtime inner-step s (params[6]); derives per-step (num_tokens,
+  // seq_len).
+  code.e(
+      "kernel::multitoken_paged_attention_sm100_draft_task_impl<bfloat16, $, "
+      "$, $, $, "
+      "$, $, $, $, $>(",
+      num_q_heads / num_kv_heads,
+      1,
+      kv_stride,
+      qkv_stride,
+      output_size,
+      head_dim,
+      max_seq_len,
+      page_size,
+      max_tokens);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->input_ptrs[2],");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    runtime_config.draft_qo_indptr_buffer,");        // DRAFT mapping
+  code.e("    runtime_config.draft_paged_kv_indptr_buffer,");  // DRAFT mapping
+  code.e("    runtime_config.draft_paged_kv_indices_buffer,"); // DRAFT mapping
+  code.e("    runtime_config.draft_paged_kv_last_page_len_buffer,"); // DRAFT
+                                                                     // mapping
+  code.e("    runtime_config.draft_step,"); // base = step+ac (per req)
+  code.e("    $,", draft_step_s);           // inner draft step s
+  code.e("    task_desc->task_metadata.request_id,");
+  code.e("    $,", params[2] > 0);
+  code.e("    $,", params[3] > 0);
+  code.e("    task_desc->input_ptrs[3],");
+  code.e("    task_desc->input_ptrs[4],");
+  code.e("    task_desc->input_ptrs[5],");
+  code.e("    task_desc->input_ptrs[6],");
+  code.e("    1e-6f,");
+  code.e("    1e-6f);");
+  return register_task_variant(TASK_ATTN_SM100_DRAFT, code.to_string());
+}
+
 int TaskRegister::register_argmax_partial_sm100_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // params[0]: num_partial_tasks

@@ -377,11 +377,12 @@ class Eagle3Builder:
         )
         return self.hidden_in
 
-    def _gqa_attn(self, attn_in, attn_out, bd):
+    def _gqa_attn(self, attn_in, attn_out, bd, s):
         """Pluggable attention sub-step for the eagle3/qwen3 draft (GQA).
 
-        Uses the DRAFT KV mapping (no q_len_override/tail_offset). For DeepSeek
-        (PR4) a _mla_attn variant is substituted.
+        Uses the DRAFT KV mapping. s = inner draft step (runtime arg): s==0
+        EXTEND (q_len=ac, seq_len=base), s>=1 DECODE (q_len=1, seq_len=base+s).
+        For DeepSeek (PR4) a _mla_attn variant is substituted.
         """
         self.mpk.paged_attention_layer(
             input=attn_in,
@@ -393,6 +394,8 @@ class Eagle3Builder:
             grid_dim=(self.mpk.max_num_batched_requests, self.num_kv_heads, 1),
             block_dim=bd,
             enable_qk_norm=False,
+            is_draft=True,  # PR3: read the DRAFT KV mapping, not the target's
+            draft_step_s=s,
         )
 
     def build_draft_extend(self, seed_token, accepted_count, attn_fn=None):
@@ -448,7 +451,7 @@ class Eagle3Builder:
                 grid_dim=(grid_for_rmsnorm_linear_layer(self.w_qkv.dim(0)), 1, 1),
                 block_dim=bd,
             )
-            attn_fn(self.attn_in, self.attn_out, bd)
+            attn_fn(self.attn_in, self.attn_out, bd, step)
             self.mpk.linear_with_residual_layer(
                 input=self.attn_out, weight=self.w_o,
                 residual=step_hidden, output=self.attn_proj_out,

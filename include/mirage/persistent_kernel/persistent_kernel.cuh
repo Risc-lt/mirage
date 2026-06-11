@@ -415,31 +415,61 @@ __device__ __forceinline__ bool
   *config.page_queue_head = page_queue_head;
   *config.page_queue_tail = page_queue_tail;
 
-  // Step 5b: mirror the just-finalized target paged-KV mapping into the
-  // independent draft mapping (PR1, behavior-preserving). The draft attention
-  // reads its own draft_* buffers; mirroring here — where the target mapping is
-  // freshly finalized and before any task runs — keeps the draft byte-identical
-  // to the target while decoupling the buffers, with no graph-ordering hazard.
-  // The accepted-count-driven independent advance replaces this mirror once
-  // draft-extend (PR2) lands.
+  // Step 5b: build the INDEPENDENT draft paged-KV mapping (PR3, accepted-count
+  // driven). The draft attention reads its own draft_* buffers and must attend
+  // its own cache prefix [0..base) with q_len = ac at the s==0 EXTEND step
+  // (the draft-attention kernel derives the s>=1 DECODE geometry from base+s
+  // via the compile-time DRAFT_STEP_S). Here `base = step + ac` is already in
+  // config.step[req] (advanced earlier this call); ac = new_token_nums[req].
+  //
+  // Encoding read by multitoken_paged_attention_sm100 (draft variant), per
+  // compacted active request r:
+  //   draft_qo_indptr:  cumulative ac           (=> num_tokens = ac)
+  //   draft_paged_kv_indptr/indices/last_page_len: pages spanning [0..base),
+  //     sized to cover base+K so DECODE steps crossing a page have their page.
+  //   draft_step[req] = base.
+  // Single linear chain per request; draft pages mirror the request's own pool
+  // (draft cache is dedicated; page p of request r lives at the same logical
+  // page index as the target for this single-chain topk=1 path).
   {
-    int const draft_total_pages =
-        config.paged_kv_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS];
-    for (int i = 0; i <= MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
-      config.draft_qo_indptr_buffer[i] = config.qo_indptr_buffer[i];
-      config.draft_paged_kv_indptr_buffer[i] = config.paged_kv_indptr_buffer[i];
-    }
+    // K = draft chain length. Spec-decode feeds mbt = K+1 candidates/iter
+    // (1 bonus + K drafts), so K = MPK_MAX_NUM_BATCHED_TOKENS - 1.
+    int const K = MPK_MAX_NUM_BATCHED_TOKENS - 1; // draft chain length
+    int draft_qo = 0;
+    int draft_pg = 0;
     for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+      int16_t request_id = config.request_ids[i];
+      config.draft_qo_indptr_buffer[i] = draft_qo;
+      config.draft_paged_kv_indptr_buffer[i] = draft_pg;
+      if (request_id == -1) {
+        continue;
+      }
+      int const base = config.step[request_id]; // = old_step + ac (advanced)
+      int const ac = config.new_token_nums[request_id];
+      // EXTEND query rows = ac (the just-confirmed accepted span).
+      draft_qo += (ac > 0 ? ac : 1);
+      // Page span must cover the whole draft chain [0 .. base+K) so a DECODE
+      // step crossing a page boundary still has its page mapped.
+      int const max_kv = base + K;
+      int const n_pages = (max_kv + MPK_PAGE_SIZE - 1) / MPK_PAGE_SIZE;
+      for (int p = 0; p < n_pages; p++) {
+        config.draft_paged_kv_indices_buffer[draft_pg + p] =
+            config.paged_kv_indices_snapshot[config.paged_kv_indptr_buffer[i] +
+                                             p];
+      }
+      draft_pg += n_pages;
+      // last_page_len encodes seq_len=base for the EXTEND read:
+      //   indptr_seq_len = (n_pages-1)*PAGE + last_page_len  must equal base.
       config.draft_paged_kv_last_page_len_buffer[i] =
-          config.paged_kv_last_page_len_buffer[i];
+          base - (n_pages - 1) * MPK_PAGE_SIZE;
+      // draft_step is indexed by the COMPACTED slot i (the draft attention
+      // kernel reads draft_step[request_id] where its request_id IS the
+      // compacted slot, mirroring how qo_indptr/paged_kv_* are indexed).
+      config.draft_step[i] = base;
     }
-    for (int i = 0; i < draft_total_pages; i++) {
-      config.draft_paged_kv_indices_buffer[i] =
-          config.paged_kv_indices_buffer[i];
-    }
-    for (int i = 0; i < config.total_num_requests; i++) {
-      config.draft_step[i] = config.step[i];
-    }
+    config.draft_qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS] = draft_qo;
+    config.draft_paged_kv_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS] =
+        draft_pg;
   }
 
   // printf("Next batch: steps[%d %d %d %d] num_active_tokens(%d)\n",

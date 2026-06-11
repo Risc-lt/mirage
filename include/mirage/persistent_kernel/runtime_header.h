@@ -177,6 +177,11 @@ enum TaskType {
   TASK_LINEAR_FP8_SM100 = 276,
   TASK_LINEAR_FP8_WITH_RESIDUAL_SM100 = 277,
   TASK_MLA_KV_GATHER_SM100 = 278,
+  // Draft paged-attention (PR3): same kernel as TASK_ATTN_SM100 but reads the
+  // DRAFT KV mapping (draft_qo_indptr/draft_paged_kv_*) instead of the global
+  // target mapping, so the draft attends its own cache with the correct
+  // attend-range/seq_len (the localized accept-collapse root cause).
+  TASK_ATTN_SM100_DRAFT = 279,
   TASK_MOE_TOPK_SIGMOID_SM100 = 280,
   TASK_ELEMENTWISE_ADD_SM100 = 281,
   TASK_SOFTMAX_GATHER_SM100 = 282,

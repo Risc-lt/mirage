@@ -805,6 +805,8 @@ class PersistentKernel:
         grid_dim: tuple,
         block_dim: tuple,
         enable_qk_norm: bool = True,
+        is_draft: bool = False,
+        draft_step_s: int = -1,
     ):
         # Currently assume that input/output
         assert input.num_dims == 2  # (num_tokens, fused_outdim / world_size)
@@ -872,7 +874,17 @@ class PersistentKernel:
         if self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "paged_attention_hopper", params)
         elif self.target_cc == 100:
-            self.kn_graph.register_task(tb_graph, "paged_attention_sm100", params)
+            # PR3: the draft attends its OWN KV mapping (draft_qo_indptr /
+            # draft_paged_kv_*), not the global target mapping. Same kernel, the
+            # _draft variant just reads the draft-prefixed runtime_config buffers.
+            if is_draft:
+                # params[6] = draft inner step s (runtime arg to the draft entry).
+                self.kn_graph.register_task(
+                    tb_graph, "paged_attention_sm100_draft",
+                    params + [draft_step_s])
+            else:
+                self.kn_graph.register_task(
+                    tb_graph, "paged_attention_sm100", params)
         else:
             self.kn_graph.register_task(tb_graph, "paged_attention", params)
 

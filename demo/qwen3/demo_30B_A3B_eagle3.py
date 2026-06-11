@@ -963,7 +963,13 @@ if __name__ == "__main__":
         for r in range(total_num_requests):
             generated_ids = tokens[r, : step[r] + 1]
             print(f"{generated_ids=}")
-            response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            # Guard the readout: a stray out-of-vocab id (e.g. uninitialized
+            # tail slot) must not abort before the accept_hist print below.
+            try:
+                _ids = [t for t in generated_ids.tolist() if 0 <= t < 200000]
+                response = tokenizer.decode(_ids, skip_special_tokens=True)
+            except Exception as _e:
+                response = f"<decode error: {_e}>"
             print(response)
 
         # Optional correctness-harness dump (inert unless MPK_DUMP_JSON is set):

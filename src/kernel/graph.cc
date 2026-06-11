@@ -606,6 +606,12 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id = task_register->register_paged_attention_sm100_task(
         customized->bgraph, params);
     task_config[op] = std::make_tuple(7, 1, TASK_ATTN_SM100, variant_id);
+  } else if (name == "paged_attention_sm100_draft") {
+    // PR3: draft attention reading the DRAFT KV mapping (same 7-in/1-out
+    // shape).
+    int variant_id = task_register->register_paged_attention_sm100_draft_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(7, 1, TASK_ATTN_SM100_DRAFT, variant_id);
   } else if (name == "argmax_partial_sm100") {
     int variant_id = task_register->register_argmax_partial_sm100_task(
         customized->bgraph, params);

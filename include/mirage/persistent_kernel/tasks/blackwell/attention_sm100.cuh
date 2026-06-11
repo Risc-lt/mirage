@@ -63,7 +63,13 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     void const *cos_ptr,
     void const *sin_ptr,
     float q_eps,
-    float k_eps) {
+    float k_eps,
+    // DRAFT override (defaults = -1 → target path, byte-identical). The draft
+    // entry below passes the per-step (num_tokens, seq_len) it derives from
+    // base + s; the target callers omit these so geometry comes from the
+    // indptr.
+    int num_tokens_override = -1,
+    int seq_len_override = -1) {
   constexpr int CONSUMER_WARPGROUP_SYNC_BARRIER_ID = 6;
   constexpr int ROTARY_SYNC_BARRIER_ID = 7;
   cutlass::arch::NamedBarrier wg_barrier(
@@ -95,7 +101,11 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     if (first_token_pos == last_token_pos) {
       return;
     }
-    int const num_tokens = last_token_pos - first_token_pos;
+    // num_tokens / seq_len: from the indptr (target) unless the DRAFT entry
+    // supplied per-step overrides (>= 0). Target callers pass -1 → unchanged.
+    int const num_tokens = (num_tokens_override >= 0)
+                               ? num_tokens_override
+                               : (last_token_pos - first_token_pos);
 
     // NOTE(Jinchen): to simplify the implementation, we assume that the
     // metadata of the paged KV cache includes the new tokens, i.e., spaces are
@@ -104,8 +114,10 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     int const first_page_pos = paged_kv_indptr_buffer_ptr[request_id];
     int const last_page_pos = paged_kv_indptr_buffer_ptr[request_id + 1];
     int const num_pages = last_page_pos - first_page_pos;
-    int const seq_len = (num_pages - 1) * PAGE_SIZE +
-                        paged_kv_last_page_len_buffer_ptr[request_id];
+    int const seq_len = (seq_len_override >= 0)
+                            ? seq_len_override
+                            : ((num_pages - 1) * PAGE_SIZE +
+                               paged_kv_last_page_len_buffer_ptr[request_id]);
     // valid_lens = [seq_len - num_tokens + 1 + i for i in range(num_tokens)]
 
     // Page indices are read directly from global memory (L2-cached)
@@ -684,6 +696,91 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
       o_dmem.at(dst_row, dst_col) = o_smem.at(src_row, src_col);
     }
   } // threadIdx.x < NUM_THREADS
+}
+
+// ---------------------------------------------------------------------------
+// Independent EAGLE3 single-chain DRAFT attention entry (PR3).
+//
+// The draft does K forwards per decode iter through this entry; `draft_step_s`
+// is the inner step index (runtime int): s==0 = EXTEND (re-seed the draft KV
+// for the just-confirmed accepted span), s>=1 = DECODE (autoregressive).
+//
+// The draft mapping buffers encode the s==0 EXTEND geometry per request:
+//   base = draft_step[req]            (= step + accepted_count, advanced)
+//   ac   = draft_qo_indptr[req+1] - draft_qo_indptr[req]   (= num_tokens@s==0)
+// Per the (Codex-validated) contract:
+//   s==0 EXTEND : num_tokens = ac, seq_len = base
+//   s>=1 DECODE : num_tokens = 1,  seq_len = base + s
+// Everything else is identical to the target kernel, so this just derives the
+// two scalars and forwards into multitoken_paged_attention_sm100_task_impl with
+// the overrides — keeping the draft path isolated while sharing the math (no
+// 640-line duplication, target path byte-identical since it passes -1).
+template <typename T,
+          int NUM_QO_HEADS,
+          int NUM_KV_HEADS,
+          int KV_CACHE_STRIDE,
+          int QKV_STRIDE,
+          int O_STRIDE,
+          int HEAD_DIM,
+          int MAX_SEQ_LEN,
+          int PAGE_SIZE,
+          int MAX_TOKENS = 8>
+__device__ __forceinline__ void
+    multitoken_paged_attention_sm100_draft_task_impl(
+        void const *qkv_ptr,
+        void *paged_k_cache_ptr,
+        void *paged_v_cache_ptr,
+        void *output_ptr,
+        int const *draft_qo_indptr_buffer_ptr,
+        int const *draft_paged_kv_indptr_buffer_ptr,
+        int const *draft_paged_kv_indices_buffer_ptr,
+        int const *draft_paged_kv_last_page_len_buffer_ptr,
+        int const *draft_step_ptr,
+        int draft_step_s,
+        int16_t request_id,
+        bool qk_norm,
+        bool rope,
+        void const *q_norm_weight_ptr,
+        void const *k_norm_weight_ptr,
+        void const *cos_ptr,
+        void const *sin_ptr,
+        float q_eps,
+        float k_eps) {
+  int const base = draft_step_ptr[request_id];
+  int const ac = draft_qo_indptr_buffer_ptr[request_id + 1] -
+                 draft_qo_indptr_buffer_ptr[request_id];
+  int const num_tokens_override = (draft_step_s == 0) ? ac : 1;
+  int const seq_len_override =
+      base + draft_step_s; // s==0 → base; s>=1 → base+s
+  multitoken_paged_attention_sm100_task_impl<T,
+                                             NUM_QO_HEADS,
+                                             NUM_KV_HEADS,
+                                             KV_CACHE_STRIDE,
+                                             QKV_STRIDE,
+                                             O_STRIDE,
+                                             HEAD_DIM,
+                                             MAX_SEQ_LEN,
+                                             PAGE_SIZE,
+                                             MAX_TOKENS>(
+      qkv_ptr,
+      paged_k_cache_ptr,
+      paged_v_cache_ptr,
+      output_ptr,
+      draft_qo_indptr_buffer_ptr,
+      draft_paged_kv_indptr_buffer_ptr,
+      draft_paged_kv_indices_buffer_ptr,
+      draft_paged_kv_last_page_len_buffer_ptr,
+      request_id,
+      qk_norm,
+      rope,
+      q_norm_weight_ptr,
+      k_norm_weight_ptr,
+      cos_ptr,
+      sin_ptr,
+      q_eps,
+      k_eps,
+      num_tokens_override,
+      seq_len_override);
 }
 
 } // namespace kernel
