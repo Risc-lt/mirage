@@ -270,6 +270,14 @@ __device__ __forceinline__ bool
         step_advance = num_tokens;
       }
       config.step[request_id] = step + step_advance;
+      // PR3 prefill-aware: the draft EXTEND processes the span just advanced
+      // over (step_advance tokens ending at the new step), NOT new_token_nums.
+      // During prefill new_token_nums is garbage, which previously made the
+      // draft write its K/V at the wrong positions -> holes/offset in the
+      // prompt-region draft KV. Stash the true span here for Step 5b's draft
+      // mapping. (draft_qo_indptr indexed by request_id as a per-req scratch;
+      // single-chain/topk=1 so no compacted-slot collision in this path.)
+      config.draft_qo_indptr_buffer[request_id] = step_advance;
 #else
       for (int j = 0; j < num_tokens; j++) {
         if (step + j + 1 >= prompt_len &&
@@ -439,14 +447,19 @@ __device__ __forceinline__ bool
     int draft_pg = 0;
     for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
       int16_t request_id = config.request_ids[i];
+      // Read the prefill-aware EXTEND span stashed in Step 1 (= step_advance:
+      // accepted_count in decode, prefill-chunk size in prefill) BEFORE the
+      // line below overwrites draft_qo_indptr_buffer with the compacted offset.
+      int const ac =
+          (request_id == -1) ? 0 : config.draft_qo_indptr_buffer[request_id];
       config.draft_qo_indptr_buffer[i] = draft_qo;
       config.draft_paged_kv_indptr_buffer[i] = draft_pg;
       if (request_id == -1) {
         continue;
       }
-      int const base = config.step[request_id]; // = old_step + ac (advanced)
-      int const ac = config.new_token_nums[request_id];
-      // EXTEND query rows = ac (the just-confirmed accepted span).
+      int const base = config.step[request_id]; // advanced cursor = old_step+ac
+      // EXTEND query rows = ac (the span just advanced over: accepted_count in
+      // decode, the prefill chunk in prefill — NOT garbage new_token_nums).
       draft_qo += (ac > 0 ? ac : 1);
       // Page span must cover the whole draft chain [0 .. base+K) so a DECODE
       // step crossing a page boundary still has its page mapped.
