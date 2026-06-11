@@ -1805,6 +1805,7 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MTP_PREPARE_VERIFY] = "TASK_MTP_PREPARE_VERIFY";
   task_type_to_name[TASK_MTP_BUILD_EMBED_INPUT] = "TASK_MTP_BUILD_EMBED_INPUT";
   task_type_to_name[TASK_COPY] = "TASK_COPY";
+  task_type_to_name[TASK_LAYER_CAPTURE] = "TASK_LAYER_CAPTURE";
   task_type_to_name[TASK_CONCAT] = "TASK_CONCAT";
   task_type_to_name[TASK_EAGLE3_D2T_REMAP] = "TASK_EAGLE3_D2T_REMAP";
   task_type_to_name[TASK_MTP_VERIFY_COMMIT] = "TASK_MTP_VERIFY_COMMIT";

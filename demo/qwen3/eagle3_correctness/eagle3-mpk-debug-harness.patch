@@ -1,0 +1,481 @@
+diff --git a/demo/qwen3/demo_30B_A3B_eagle3.py b/demo/qwen3/demo_30B_A3B_eagle3.py
+index 9243cc31..1aca22d0 100644
+--- a/demo/qwen3/demo_30B_A3B_eagle3.py
++++ b/demo/qwen3/demo_30B_A3B_eagle3.py
+@@ -865,8 +865,26 @@ if __name__ == "__main__":
+                 aux_h0=eagle3_aux_h0, aux_h1=eagle3_aux_h1,
+                 aux_h2=eagle3_aux_h2, accepted_count=accepted_count,
+             )
++            # DEBUG (MPK_DRAFT_DUMP): per-position draft sub-step capture for the
++            # MPK-vs-sglang per-layer comparison (fc/attn_proj/midlayer/norm).
++            _draft_dump = os.environ.get("MPK_DRAFT_DUMP")
++            _draft_cap = None
++            _draft_cap_bufs = {}
++            if _draft_dump:
++                for _k in ("fc", "attn_proj", "midlayer", "norm"):
++                    _b = torch.zeros(args.max_seq_length, hidden_size,
++                                     dtype=torch.bfloat16, device="cuda")
++                    _draft_cap_bufs[_k] = _b
++                _draft_cap = {
++                    "fn": mpk.layer_capture_layer,
++                    "max_seq_len": args.max_seq_length,
++                }
++                for _k, _b in _draft_cap_bufs.items():
++                    _draft_cap[_k] = mpk.attach_input(
++                        torch_tensor=_b, name=f"draftcap_{_k}")
+             eagle3.build_draft_extend(
+                 seed_token=argmax_out, accepted_count=accepted_count,
++                capture=_draft_cap,
+             )
+             mpk.mtp_draft_token_copy_layer(
+                 all_draft_ids=eagle3._attach_cache["eagle3_all_draft_ids"],
+@@ -960,6 +978,30 @@ if __name__ == "__main__":
+         run_time = starter.elapsed_time(ender)
+ 
+         print("tokens.shape = ", tokens.shape)
++        # DEBUG (MPK_DRAFT_DUMP): persist the draft sub-step captures at prompt
++        # positions for the MPK-vs-sglang per-layer comparison.
++        if args.eagle3 and os.environ.get("MPK_DRAFT_DUMP") and _draft_cap_bufs:
++            _plen = int(prompt_lengths[0].item())
++            _out = {k: v[:_plen].float().cpu()
++                    for k, v in _draft_cap_bufs.items()}
++            torch.save(_out, os.environ["MPK_DRAFT_DUMP"])
++            print(f"[draft-dump] wrote {os.environ['MPK_DRAFT_DUMP']} "
++                  f"fc/attn_proj/midlayer/norm each "
++                  f"{tuple(_out['fc'].shape)}")
++        # DEBUG (MPK_DRAFTKV_DUMP): persist the draft K/V cache content (the
++        # write-side check). page_size>=max_seq so page0 row p = abs pos p.
++        if args.eagle3 and os.environ.get("MPK_DRAFTKV_DUMP"):
++            _plen = int(prompt_lengths[0].item())
++            _kc = eagle3._k_cache_buf[0, :_plen].float().cpu()  # [plen,kvH,hd]
++            _vc = eagle3._v_cache_buf[0, :_plen].float().cpu()
++            # prompt tokens (the draft input lives in this seq buffer) for
++            # token-id alignment vs sglang's per-row ids.
++            _ptok = tokens[0, :_plen].cpu().tolist()
++            torch.save({"k": _kc, "v": _vc, "prompt_len": _plen,
++                        "prompt_tokens": _ptok},
++                       os.environ["MPK_DRAFTKV_DUMP"])
++            print(f"[draftkv-dump] wrote {os.environ['MPK_DRAFTKV_DUMP']} "
++                  f"k/v {tuple(_kc.shape)} ptok[:6]={_ptok[:6]}")
+         for r in range(total_num_requests):
+             generated_ids = tokens[r, : step[r] + 1]
+             print(f"{generated_ids=}")
+diff --git a/include/mirage/kernel/task_register.h b/include/mirage/kernel/task_register.h
+index 95d190c9..bb4da0e8 100644
+--- a/include/mirage/kernel/task_register.h
++++ b/include/mirage/kernel/task_register.h
+@@ -188,6 +188,8 @@ public:
+   // Eagle3 tasks
+   int register_copy_task(threadblock::Graph const &bgraph,
+                          std::vector<int> const &params);
++  int register_layer_capture_task(threadblock::Graph const &bgraph,
++                                  std::vector<int> const &params);
+   int register_concat_task(threadblock::Graph const &bgraph,
+                            std::vector<int> const &params);
+   int register_eagle3_d2t_remap_task(threadblock::Graph const &bgraph,
+diff --git a/include/mirage/persistent_kernel/runtime_header.h b/include/mirage/persistent_kernel/runtime_header.h
+index bf8b063a..5285391b 100644
+--- a/include/mirage/persistent_kernel/runtime_header.h
++++ b/include/mirage/persistent_kernel/runtime_header.h
+@@ -145,6 +145,7 @@ enum TaskType {
+   TASK_SM100_TMA_START_TASK = 231,
+   TASK_COPY = 232,
+   TASK_CONCAT = 233,
++  TASK_LAYER_CAPTURE = 234, // DEBUG: per-position layer/sub-step capture
+   TASK_EAGLE3_D2T_REMAP = 235,
+   TASK_EAGLE3_COMMIT = 236,
+   TASK_MOE_W13_FP8_SM100 = 248,
+diff --git a/include/mirage/persistent_kernel/tasks/speculative_decoding/eagle3_ops.cuh b/include/mirage/persistent_kernel/tasks/speculative_decoding/eagle3_ops.cuh
+index f5de70f5..8eb3482b 100644
+--- a/include/mirage/persistent_kernel/tasks/speculative_decoding/eagle3_ops.cuh
++++ b/include/mirage/persistent_kernel/tasks/speculative_decoding/eagle3_ops.cuh
+@@ -47,6 +47,35 @@ __device__ __forceinline__ void
+   }
+ }
+ 
++// --- DEBUG: position-indexed layer capture (per-layer/sub-step compare) ---
++// Copy the src [NUM_ROWS, HIDDEN] tensor into a persistent dst[MAX_SEQ_LEN,
++// HIDDEN] buffer at absolute rows [step .. step+NUM_ROWS), so the mbt prompt
++// positions processed in one prefill chunk all land at their true positions
++// (prefill advances step by NUM_ROWS=mbt/iter; capturing only row 0 left
++// stride-mbt holes). Env-gated harness; not used in production paths.
++template <typename T, int HIDDEN_DIM, int MAX_SEQ_LEN, int NUM_ROWS>
++__device__ __forceinline__ void
++    layer_capture_kernel(void const *__restrict__ src_ptr,
++                         void const *__restrict__ step_ptr,
++                         void *__restrict__ dst_ptr,
++                         int request_id) {
++  T const *__restrict__ src = static_cast<T const *>(src_ptr);
++  T *__restrict__ dst = static_cast<T *>(dst_ptr);
++  int const *__restrict__ step = static_cast<int const *>(step_ptr);
++  int const base = step[request_id];
++  int const tid = threadIdx.x;
++  int const stride = blockDim.x;
++  for (int r = 0; r < NUM_ROWS; r++) {
++    int const row = base + r;
++    if (row < 0 || row >= MAX_SEQ_LEN) {
++      continue;
++    }
++    for (int i = tid; i < HIDDEN_DIM; i += stride) {
++      dst[row * HIDDEN_DIM + i] = src[r * HIDDEN_DIM + i];
++    }
++  }
++}
++
+ // --- Tensor Concatenation along dim 1 ---
+ // Concatenates N (BATCH_SIZE, HIDDEN_DIM) tensors along dim 1, producing
+ // (BATCH_SIZE, N * HIDDEN_DIM).
+diff --git a/include/mirage/persistent_kernel/tma.cuh b/include/mirage/persistent_kernel/tma.cuh
+index f115127e..4315077e 100644
+--- a/include/mirage/persistent_kernel/tma.cuh
++++ b/include/mirage/persistent_kernel/tma.cuh
+@@ -1621,6 +1621,7 @@ __host__ inline void create_tma_desc_by_task(FullTaskDesc &task_desc) {
+     }
+     // Eagle3 kernels don't need TMA.
+     case TASK_COPY:
++    case TASK_LAYER_CAPTURE:
+     case TASK_CONCAT:
+     case TASK_EAGLE3_D2T_REMAP:
+     case TASK_EAGLE3_COMMIT: {
+diff --git a/python/mirage/mpk/models/eagle3/builder.py b/python/mirage/mpk/models/eagle3/builder.py
+index 760b7007..1c96d223 100644
+--- a/python/mirage/mpk/models/eagle3/builder.py
++++ b/python/mirage/mpk/models/eagle3/builder.py
+@@ -398,15 +398,21 @@ class Eagle3Builder:
+             draft_step_s=s,
+         )
+ 
+-    def build_draft_extend(self, seed_token, accepted_count, attn_fn=None):
++    def build_draft_extend(self, seed_token, accepted_count, attn_fn=None,
++                           capture=None):
+         """General draft extend: one+K-step draft prefill seeded from the
+-        prepared input. attn_fn(attn_in, attn_out, bd) is the pluggable
++        prepared input. attn_fn(attn_in, attn_out, bd, s) is the pluggable
+         attention (defaults to eagle3 GQA). Requires prepare_draft_input to have
+         populated self.extend_seed_hidden first.
+ 
+         Mirrors the build_draft_loop step body but (a) seeds step-0 hidden from
+         extend_seed_hidden (not the in-loop aux→fc), and (b) uses the draft
+-        mapping via attn_fn with no override params.
++        mapping via attn_fn with the per-step s.
++
++        capture (DEBUG, optional): dict with keys 'fn' (layer_capture_layer),
++        'max_seq_len', and dump DTensors 'fc'/'attn_proj'/'midlayer'/'norm'.
++        When set, captures those step-0 sub-step tensors for the per-layer
++        MPK-vs-sglang comparison.
+         """
+         if attn_fn is None:
+             attn_fn = self._gqa_attn
+@@ -426,6 +432,13 @@ class Eagle3Builder:
+             # MTP formulation (PR4), not eagle3's mbt-parallel structure.
+             step_hidden = self.hidden_in if step == 0 else self.draft_hidden
+ 
++            def _cap(key, tensor):
++                if capture is not None and step == 0 and key in capture:
++                    capture["fn"](input=tensor, output=capture[key],
++                                  grid_dim=(1, 1, 1), block_dim=bd,
++                                  max_seq_len=capture["max_seq_len"])
++
++            _cap("fc", self.hidden_in)
+             self.mpk.embed_layer(
+                 input=draft_in_token, weight=self.target_w_embed,
+                 output=self.embed_out,
+@@ -457,6 +470,7 @@ class Eagle3Builder:
+                 residual=step_hidden, output=self.attn_proj_out,
+                 grid_dim=(H // 64, 1, 1), block_dim=bd,
+             )
++            _cap("attn_proj", self.attn_proj_out)
+             self.mpk.rmsnorm_layer(
+                 input=self.attn_proj_out, weight=self.w_post_ln,
+                 output=self.post_ln_out,
+@@ -477,11 +491,13 @@ class Eagle3Builder:
+                 residual=self.attn_proj_out, output=self.draft_hidden,
+                 grid_dim=(H // 64, 1, 1), block_dim=bd,
+             )
++            _cap("midlayer", self.draft_hidden)
+             self.mpk.rmsnorm_layer(
+                 input=self.draft_hidden, weight=self.w_final_norm,
+                 output=self.norm_out,
+                 grid_dim=(mbt, 1, 1), block_dim=bd,
+             )
++            _cap("norm", self.norm_out)
+             self.mpk.linear_layer(
+                 input=self.norm_out, weight=self.w_lm_head,
+                 output=self.logits_hot,
+diff --git a/python/mirage/mpk/persistent_kernel.py b/python/mirage/mpk/persistent_kernel.py
+index 8f5ef87e..8053dc83 100644
+--- a/python/mirage/mpk/persistent_kernel.py
++++ b/python/mirage/mpk/persistent_kernel.py
+@@ -2371,6 +2371,28 @@ class PersistentKernel:
+         self.kn_graph.customized([input, output], tb_graph)
+         self.kn_graph.register_task(tb_graph, "copy", params)
+ 
++    def layer_capture_layer(
++        self,
++        input: DTensor,    # (batch, hidden) — row 0 captured
++        output: DTensor,   # (max_seq_len, hidden) persistent dump buffer
++        grid_dim: tuple,
++        block_dim: tuple,
++        max_seq_len: int,
++    ):
++        """DEBUG: capture input row-0 into output[step, :] (step from runtime
++        config), accumulating a [seq, hidden] per-position dump across iters.
++        Env-gated harness for per-layer/sub-step MPK-vs-sglang comparison."""
++        assert input.num_dims == 2
++        assert output.num_dims == 2
++        hidden_dim = input.dim(1)
++        num_rows = input.dim(0)  # mbt: the chunk's row count
++        params = [hidden_dim, max_seq_len, num_rows]
++        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
++        tb_graph.new_input(input, (-1, -1, -1), -1, True)
++        tb_graph.new_input(output, (-1, -1, -1), -1, True)
++        self.kn_graph.customized([input, output], tb_graph)
++        self.kn_graph.register_task(tb_graph, "layer_capture", params)
++
+     def concat_layer(
+         self,
+         inputs: list,      # list of N (batch, hidden_dim) DTensors
+diff --git a/src/kernel/graph.cc b/src/kernel/graph.cc
+index b65fb058..d84d3c3a 100644
+--- a/src/kernel/graph.cc
++++ b/src/kernel/graph.cc
+@@ -844,6 +844,11 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
+     int variant_id =
+         task_register->register_copy_task(customized->bgraph, params);
+     task_config[op] = std::make_tuple(1, 1, TASK_COPY, variant_id);
++  } else if (name == "layer_capture") {
++    // DEBUG: 1 in (src), 1 out (persistent buffer); step from runtime_config.
++    int variant_id =
++        task_register->register_layer_capture_task(customized->bgraph, params);
++    task_config[op] = std::make_tuple(1, 1, TASK_LAYER_CAPTURE, variant_id);
+   } else if (name == "concat") {
+     // params[2] = N (number of (B,H) inputs concatenated along dim 1).
+     int n = params[2];
+diff --git a/src/kernel/runtime.cc b/src/kernel/runtime.cc
+index 121fdfeb..23e8bd16 100644
+--- a/src/kernel/runtime.cc
++++ b/src/kernel/runtime.cc
+@@ -1805,6 +1805,7 @@ TaskGraphResult print_task_graph(
+   task_type_to_name[TASK_MTP_PREPARE_VERIFY] = "TASK_MTP_PREPARE_VERIFY";
+   task_type_to_name[TASK_MTP_BUILD_EMBED_INPUT] = "TASK_MTP_BUILD_EMBED_INPUT";
+   task_type_to_name[TASK_COPY] = "TASK_COPY";
++  task_type_to_name[TASK_LAYER_CAPTURE] = "TASK_LAYER_CAPTURE";
+   task_type_to_name[TASK_CONCAT] = "TASK_CONCAT";
+   task_type_to_name[TASK_EAGLE3_D2T_REMAP] = "TASK_EAGLE3_D2T_REMAP";
+   task_type_to_name[TASK_MTP_VERIFY_COMMIT] = "TASK_MTP_VERIFY_COMMIT";
+diff --git a/src/kernel/task_register.cc b/src/kernel/task_register.cc
+index fcaf3deb..0d00476f 100644
+--- a/src/kernel/task_register.cc
++++ b/src/kernel/task_register.cc
+@@ -4495,6 +4495,27 @@ int TaskRegister::register_copy_task(threadblock::Graph const &bgraph,
+   return register_task_variant(TASK_COPY, code.to_string());
+ }
+ 
++int TaskRegister::register_layer_capture_task(
++    threadblock::Graph const &bgraph, std::vector<int> const &params) {
++  // DEBUG: params[0]=hidden_dim, params[1]=max_seq_len, params[2]=num_rows(mbt).
++  // Capture src[num_rows,hidden] into dst[step .. step+num_rows) (step from the
++  // runtime global), so a prefill chunk's mbt positions all land correctly.
++  assert(params.size() == 3);
++  int hidden_dim = params[0];
++  int max_seq_len = params[1];
++  int num_rows = params[2];
++
++  mirage::transpiler::CodeKeeper code;
++  code.inc_indent();
++  code.e("kernel::layer_capture_kernel<bfloat16, $, $, $>(", hidden_dim,
++         max_seq_len, num_rows);
++  code.e("    task_desc->input_ptrs[0],");             // src
++  code.e("    runtime_config.step,");                  // step (global)
++  code.e("    task_desc->output_ptrs[0],");            // dst persistent buffer
++  code.e("    task_desc->task_metadata.request_id);"); // request_id
++  return register_task_variant(TASK_LAYER_CAPTURE, code.to_string());
++}
++
+ int TaskRegister::register_concat_task(threadblock::Graph const &bgraph,
+                                        std::vector<int> const &params) {
+   // params[0]: batch_size, params[1]: hidden_dim, params[2]: N (num inputs)
+diff --git a/demo/qwen3/eagle3_correctness/run_sglang_target_greedy.py b/demo/qwen3/eagle3_correctness/run_sglang_target_greedy.py
+new file mode 100644
+index 00000000..2c93adbf
+--- /dev/null
++++ b/demo/qwen3/eagle3_correctness/run_sglang_target_greedy.py
+@@ -0,0 +1,81 @@
++"""Plain sglang TARGET greedy decode (NO speculative decoding) on the same
++templated prompt the MPK demo uses, dumping output token ids + per-token
++logprobs. This is the target-side oracle for the per-position argmax compare
++against MPK's greedy run (/tmp/mpk_greedy.json).
++
++Run in the `sglang` conda env:
++    conda run -n sglang python \
++      demo/qwen3/eagle3_correctness/run_sglang_target_greedy.py \
++      --max-new-tokens 256 --out /tmp/sglang_greedy.json
++"""
++import argparse
++import json
++
++import sglang as sgl
++from transformers import AutoTokenizer
++
++# Must match demo/qwen3/demo_30B_A3B_eagle3.py (system + user message).
++PROMPT = "Give me a short introduction to large language model."
++SYSTEM = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
++TARGET = "Qwen/Qwen3-30B-A3B"
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--max-new-tokens", type=int, default=256)
++    ap.add_argument("--out", type=str, default="/tmp/sglang_greedy.json")
++    ap.add_argument("--target", type=str, default=TARGET)
++    ap.add_argument("--context-length", type=int, default=4096)
++    ap.add_argument("--mem-fraction-static", type=float, default=0.8)
++    args = ap.parse_args()
++
++    tok = AutoTokenizer.from_pretrained(args.target)
++    text = tok.apply_chat_template(
++        [{"role": "system", "content": SYSTEM},
++         {"role": "user", "content": PROMPT}],
++        tokenize=False,
++        add_generation_prompt=True,
++    )
++
++    # Plain target, NO speculative decoding.
++    llm = sgl.Engine(
++        model_path=args.target,
++        dtype="bfloat16",
++        disable_cuda_graph=True,
++        context_length=args.context_length,
++        mem_fraction_static=args.mem_fraction_static,
++    )
++    out = llm.generate(
++        text,
++        sampling_params={"temperature": 0.0, "max_new_tokens": args.max_new_tokens},
++        return_logprob=True,
++    )
++    llm.shutdown()
++
++    meta = out.get("meta_info", {})
++    otl = meta.get("output_token_logprobs")  # [(logprob, tok_id, tok_text), ...]
++    if otl:
++        out_ids = [e[1] for e in otl]
++        out_logprobs = [e[0] for e in otl]
++    else:
++        out_ids = tok(out["text"], add_special_tokens=False)["input_ids"]
++        out_logprobs = None
++
++    result = {
++        "framework": "sglang", "eagle3": False,
++        "target": args.target,
++        "prompt": PROMPT, "templated_prompt": text,
++        "output_text": out["text"],
++        "output_token_ids": out_ids,
++        "output_token_logprobs": out_logprobs,
++        "completion_tokens": meta.get("completion_tokens"),
++    }
++    with open(args.out, "w") as f:
++        json.dump(result, f, indent=2)
++    print(f"[sglang-greedy] wrote {args.out} ({len(out_ids)} tokens)")
++    print(f"[sglang-greedy] first 20 ids: {out_ids[:20]}")
++    print(f"[sglang-greedy] text[:160]: {out['text'][:160]!r}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/demo/qwen3/eagle3_correctness/sglang_layer_dump.py b/demo/qwen3/eagle3_correctness/sglang_layer_dump.py
+new file mode 100644
+index 00000000..8a70efe3
+--- /dev/null
++++ b/demo/qwen3/eagle3_correctness/sglang_layer_dump.py
+@@ -0,0 +1,91 @@
++"""Dump sglang's per-layer PREFILL hidden for Qwen3-30B-A3B (target), to compare
++against MPK's per-layer capture (/tmp/mpk_layers.pt).
++
++Wraps Qwen3MoeDecoderLayer.forward to record, at layer ENTRY, the full
++residual-stream hidden = hidden_states + (residual or 0). This matches MPK's
++capture point `x` (the layer-input hidden after the previous layer's residual
++add, demo_30B_A3B_eagle3.py). We capture only the PREFILL forward (the first
++forward whose token count == prompt_len).
++
++Run in the `sglang` conda env:
++    conda run -n sglang python \
++      demo/qwen3/eagle3_correctness/sglang_layer_dump.py --out /tmp/sglang_layers.pt
++"""
++import argparse
++import json
++
++import torch
++import sglang as sgl
++from transformers import AutoTokenizer
++
++PROMPT = "Give me a short introduction to large language model."
++SYSTEM = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
++TARGET = "Qwen/Qwen3-30B-A3B"
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out", type=str, default="/tmp/sglang_layers.pt")
++    ap.add_argument("--target", type=str, default=TARGET)
++    ap.add_argument("--context-length", type=int, default=4096)
++    ap.add_argument("--mem-fraction-static", type=float, default=0.8)
++    args = ap.parse_args()
++
++    tok = AutoTokenizer.from_pretrained(args.target)
++    text = tok.apply_chat_template(
++        [{"role": "system", "content": SYSTEM},
++         {"role": "user", "content": PROMPT}],
++        tokenize=False, add_generation_prompt=True)
++    prompt_len = len(tok(text, add_special_tokens=False)["input_ids"])
++
++    from sglang.srt.models import qwen3_moe
++    LayerCls = qwen3_moe.Qwen3MoeDecoderLayer
++    orig_forward = LayerCls.forward
++
++    # captured[layer_idx] = hidden at layer entry for the PREFILL forward only.
++    # Within one forward, layers run in order 0,1,2,... so first-call order ==
++    # layer index. We reset the per-forward counter whenever we see layer-entry
++    # for a fresh forward of prompt_len tokens.
++    captured = {}
++    state = {"counter": 0, "done": False}
++
++    def patched_forward(self, positions, hidden_states, forward_batch,
++                        residual=None, *a, **kw):
++        is_prefill = (hidden_states is not None
++                      and hidden_states.shape[0] == prompt_len)
++        # Capture every layer of the FIRST prefill forward (layers run in order
++        # 0,1,2,...; counter resets are unneeded since we only do one forward).
++        if is_prefill and not state["done"]:
++            li = state["counter"]
++            state["counter"] += 1
++            h = hidden_states if residual is None else hidden_states + residual
++            captured[li] = h.detach().float().cpu().clone()
++        return orig_forward(self, positions, hidden_states, forward_batch,
++                            residual, *a, **kw)
++
++    LayerCls.forward = patched_forward
++
++    llm = sgl.Engine(
++        model_path=args.target, dtype="bfloat16", disable_cuda_graph=True,
++        context_length=args.context_length,
++        mem_fraction_static=args.mem_fraction_static)
++
++    out = llm.generate(
++        text,
++        sampling_params={"temperature": 0.0, "max_new_tokens": 1},
++        return_logprob=False)
++    llm.shutdown()
++
++    if not captured:
++        print("[sglang-layer-dump] WARNING: no layers captured "
++              f"(prompt_len={prompt_len}). Check the prefill token count.")
++        return
++    n = max(captured) + 1
++    stack = torch.stack([captured[i] for i in range(n)], dim=0)
++    torch.save({"layers": stack, "prompt_len": prompt_len}, args.out)
++    print(f"[sglang-layer-dump] wrote {args.out} shape={tuple(stack.shape)} "
++          f"(layers, prompt_len, hidden), prompt_len={prompt_len}")
++
++
++if __name__ == "__main__":
++    main()

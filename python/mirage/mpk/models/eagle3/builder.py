@@ -398,15 +398,21 @@ class Eagle3Builder:
             draft_step_s=s,
         )
 
-    def build_draft_extend(self, seed_token, accepted_count, attn_fn=None):
+    def build_draft_extend(self, seed_token, accepted_count, attn_fn=None,
+                           capture=None):
         """General draft extend: one+K-step draft prefill seeded from the
-        prepared input. attn_fn(attn_in, attn_out, bd) is the pluggable
+        prepared input. attn_fn(attn_in, attn_out, bd, s) is the pluggable
         attention (defaults to eagle3 GQA). Requires prepare_draft_input to have
         populated self.extend_seed_hidden first.
 
         Mirrors the build_draft_loop step body but (a) seeds step-0 hidden from
         extend_seed_hidden (not the in-loop aux→fc), and (b) uses the draft
-        mapping via attn_fn with no override params.
+        mapping via attn_fn with the per-step s.
+
+        capture (DEBUG, optional): dict with keys 'fn' (layer_capture_layer),
+        'max_seq_len', and dump DTensors 'fc'/'attn_proj'/'midlayer'/'norm'.
+        When set, captures those step-0 sub-step tensors for the per-layer
+        MPK-vs-sglang comparison.
         """
         if attn_fn is None:
             attn_fn = self._gqa_attn
@@ -426,6 +432,13 @@ class Eagle3Builder:
             # MTP formulation (PR4), not eagle3's mbt-parallel structure.
             step_hidden = self.hidden_in if step == 0 else self.draft_hidden
 
+            def _cap(key, tensor):
+                if capture is not None and step == 0 and key in capture:
+                    capture["fn"](input=tensor, output=capture[key],
+                                  grid_dim=(1, 1, 1), block_dim=bd,
+                                  max_seq_len=capture["max_seq_len"])
+
+            _cap("fc", self.hidden_in)
             self.mpk.embed_layer(
                 input=draft_in_token, weight=self.target_w_embed,
                 output=self.embed_out,
@@ -457,6 +470,7 @@ class Eagle3Builder:
                 residual=step_hidden, output=self.attn_proj_out,
                 grid_dim=(H // 64, 1, 1), block_dim=bd,
             )
+            _cap("attn_proj", self.attn_proj_out)
             self.mpk.rmsnorm_layer(
                 input=self.attn_proj_out, weight=self.w_post_ln,
                 output=self.post_ln_out,
@@ -477,11 +491,13 @@ class Eagle3Builder:
                 residual=self.attn_proj_out, output=self.draft_hidden,
                 grid_dim=(H // 64, 1, 1), block_dim=bd,
             )
+            _cap("midlayer", self.draft_hidden)
             self.mpk.rmsnorm_layer(
                 input=self.draft_hidden, weight=self.w_final_norm,
                 output=self.norm_out,
                 grid_dim=(mbt, 1, 1), block_dim=bd,
             )
+            _cap("norm", self.norm_out)
             self.mpk.linear_layer(
                 input=self.norm_out, weight=self.w_lm_head,
                 output=self.logits_hot,

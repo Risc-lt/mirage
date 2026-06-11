@@ -2371,6 +2371,28 @@ class PersistentKernel:
         self.kn_graph.customized([input, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "copy", params)
 
+    def layer_capture_layer(
+        self,
+        input: DTensor,    # (batch, hidden) — row 0 captured
+        output: DTensor,   # (max_seq_len, hidden) persistent dump buffer
+        grid_dim: tuple,
+        block_dim: tuple,
+        max_seq_len: int,
+    ):
+        """DEBUG: capture input row-0 into output[step, :] (step from runtime
+        config), accumulating a [seq, hidden] per-position dump across iters.
+        Env-gated harness for per-layer/sub-step MPK-vs-sglang comparison."""
+        assert input.num_dims == 2
+        assert output.num_dims == 2
+        hidden_dim = input.dim(1)
+        num_rows = input.dim(0)  # mbt: the chunk's row count
+        params = [hidden_dim, max_seq_len, num_rows]
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, -1, -1), -1, True)
+        self.kn_graph.customized([input, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "layer_capture", params)
+
     def concat_layer(
         self,
         inputs: list,      # list of N (batch, hidden_dim) DTensors

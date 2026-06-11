@@ -4495,6 +4495,30 @@ int TaskRegister::register_copy_task(threadblock::Graph const &bgraph,
   return register_task_variant(TASK_COPY, code.to_string());
 }
 
+int TaskRegister::register_layer_capture_task(threadblock::Graph const &bgraph,
+                                              std::vector<int> const &params) {
+  // DEBUG: params[0]=hidden_dim, params[1]=max_seq_len,
+  // params[2]=num_rows(mbt). Capture src[num_rows,hidden] into dst[step ..
+  // step+num_rows) (step from the runtime global), so a prefill chunk's mbt
+  // positions all land correctly.
+  assert(params.size() == 3);
+  int hidden_dim = params[0];
+  int max_seq_len = params[1];
+  int num_rows = params[2];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::layer_capture_kernel<bfloat16, $, $, $>(",
+         hidden_dim,
+         max_seq_len,
+         num_rows);
+  code.e("    task_desc->input_ptrs[0],");             // src
+  code.e("    runtime_config.step,");                  // step (global)
+  code.e("    task_desc->output_ptrs[0],");            // dst persistent buffer
+  code.e("    task_desc->task_metadata.request_id);"); // request_id
+  return register_task_variant(TASK_LAYER_CAPTURE, code.to_string());
+}
+
 int TaskRegister::register_concat_task(threadblock::Graph const &bgraph,
                                        std::vector<int> const &params) {
   // params[0]: batch_size, params[1]: hidden_dim, params[2]: N (num inputs)

@@ -844,6 +844,11 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id =
         task_register->register_copy_task(customized->bgraph, params);
     task_config[op] = std::make_tuple(1, 1, TASK_COPY, variant_id);
+  } else if (name == "layer_capture") {
+    // DEBUG: 1 in (src), 1 out (persistent buffer); step from runtime_config.
+    int variant_id =
+        task_register->register_layer_capture_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 1, TASK_LAYER_CAPTURE, variant_id);
   } else if (name == "concat") {
     // params[2] = N (number of (B,H) inputs concatenated along dim 1).
     int n = params[2];

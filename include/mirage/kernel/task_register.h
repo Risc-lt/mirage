@@ -188,6 +188,8 @@ public:
   // Eagle3 tasks
   int register_copy_task(threadblock::Graph const &bgraph,
                          std::vector<int> const &params);
+  int register_layer_capture_task(threadblock::Graph const &bgraph,
+                                  std::vector<int> const &params);
   int register_concat_task(threadblock::Graph const &bgraph,
                            std::vector<int> const &params);
   int register_eagle3_d2t_remap_task(threadblock::Graph const &bgraph,

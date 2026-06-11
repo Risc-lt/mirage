@@ -865,8 +865,26 @@ if __name__ == "__main__":
                 aux_h0=eagle3_aux_h0, aux_h1=eagle3_aux_h1,
                 aux_h2=eagle3_aux_h2, accepted_count=accepted_count,
             )
+            # DEBUG (MPK_DRAFT_DUMP): per-position draft sub-step capture for the
+            # MPK-vs-sglang per-layer comparison (fc/attn_proj/midlayer/norm).
+            _draft_dump = os.environ.get("MPK_DRAFT_DUMP")
+            _draft_cap = None
+            _draft_cap_bufs = {}
+            if _draft_dump:
+                for _k in ("fc", "attn_proj", "midlayer", "norm"):
+                    _b = torch.zeros(args.max_seq_length, hidden_size,
+                                     dtype=torch.bfloat16, device="cuda")
+                    _draft_cap_bufs[_k] = _b
+                _draft_cap = {
+                    "fn": mpk.layer_capture_layer,
+                    "max_seq_len": args.max_seq_length,
+                }
+                for _k, _b in _draft_cap_bufs.items():
+                    _draft_cap[_k] = mpk.attach_input(
+                        torch_tensor=_b, name=f"draftcap_{_k}")
             eagle3.build_draft_extend(
                 seed_token=argmax_out, accepted_count=accepted_count,
+                capture=_draft_cap,
             )
             mpk.mtp_draft_token_copy_layer(
                 all_draft_ids=eagle3._attach_cache["eagle3_all_draft_ids"],
@@ -960,6 +978,30 @@ if __name__ == "__main__":
         run_time = starter.elapsed_time(ender)
 
         print("tokens.shape = ", tokens.shape)
+        # DEBUG (MPK_DRAFT_DUMP): persist the draft sub-step captures at prompt
+        # positions for the MPK-vs-sglang per-layer comparison.
+        if args.eagle3 and os.environ.get("MPK_DRAFT_DUMP") and _draft_cap_bufs:
+            _plen = int(prompt_lengths[0].item())
+            _out = {k: v[:_plen].float().cpu()
+                    for k, v in _draft_cap_bufs.items()}
+            torch.save(_out, os.environ["MPK_DRAFT_DUMP"])
+            print(f"[draft-dump] wrote {os.environ['MPK_DRAFT_DUMP']} "
+                  f"fc/attn_proj/midlayer/norm each "
+                  f"{tuple(_out['fc'].shape)}")
+        # DEBUG (MPK_DRAFTKV_DUMP): persist the draft K/V cache content (the
+        # write-side check). page_size>=max_seq so page0 row p = abs pos p.
+        if args.eagle3 and os.environ.get("MPK_DRAFTKV_DUMP"):
+            _plen = int(prompt_lengths[0].item())
+            _kc = eagle3._k_cache_buf[0, :_plen].float().cpu()  # [plen,kvH,hd]
+            _vc = eagle3._v_cache_buf[0, :_plen].float().cpu()
+            # prompt tokens (the draft input lives in this seq buffer) for
+            # token-id alignment vs sglang's per-row ids.
+            _ptok = tokens[0, :_plen].cpu().tolist()
+            torch.save({"k": _kc, "v": _vc, "prompt_len": _plen,
+                        "prompt_tokens": _ptok},
+                       os.environ["MPK_DRAFTKV_DUMP"])
+            print(f"[draftkv-dump] wrote {os.environ['MPK_DRAFTKV_DUMP']} "
+                  f"k/v {tuple(_kc.shape)} ptok[:6]={_ptok[:6]}")
         for r in range(total_num_requests):
             generated_ids = tokens[r, : step[r] + 1]
             print(f"{generated_ids=}")

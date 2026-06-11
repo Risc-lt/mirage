@@ -47,6 +47,35 @@ __device__ __forceinline__ void
   }
 }
 
+// --- DEBUG: position-indexed layer capture (per-layer/sub-step compare) ---
+// Copy the src [NUM_ROWS, HIDDEN] tensor into a persistent dst[MAX_SEQ_LEN,
+// HIDDEN] buffer at absolute rows [step .. step+NUM_ROWS), so the mbt prompt
+// positions processed in one prefill chunk all land at their true positions
+// (prefill advances step by NUM_ROWS=mbt/iter; capturing only row 0 left
+// stride-mbt holes). Env-gated harness; not used in production paths.
+template <typename T, int HIDDEN_DIM, int MAX_SEQ_LEN, int NUM_ROWS>
+__device__ __forceinline__ void
+    layer_capture_kernel(void const *__restrict__ src_ptr,
+                         void const *__restrict__ step_ptr,
+                         void *__restrict__ dst_ptr,
+                         int request_id) {
+  T const *__restrict__ src = static_cast<T const *>(src_ptr);
+  T *__restrict__ dst = static_cast<T *>(dst_ptr);
+  int const *__restrict__ step = static_cast<int const *>(step_ptr);
+  int const base = step[request_id];
+  int const tid = threadIdx.x;
+  int const stride = blockDim.x;
+  for (int r = 0; r < NUM_ROWS; r++) {
+    int const row = base + r;
+    if (row < 0 || row >= MAX_SEQ_LEN) {
+      continue;
+    }
+    for (int i = tid; i < HIDDEN_DIM; i += stride) {
+      dst[row * HIDDEN_DIM + i] = src[r * HIDDEN_DIM + i];
+    }
+  }
+}
+
 // --- Tensor Concatenation along dim 1 ---
 // Concatenates N (BATCH_SIZE, HIDDEN_DIM) tensors along dim 1, producing
 // (BATCH_SIZE, N * HIDDEN_DIM).

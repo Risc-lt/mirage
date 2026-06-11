@@ -1,0 +1,236 @@
+diff --git a/python/sglang/srt/models/llama.py b/python/sglang/srt/models/llama.py
+index dc39732ceb..b1079bdcf8 100644
+--- a/python/sglang/srt/models/llama.py
++++ b/python/sglang/srt/models/llama.py
+@@ -242,6 +242,41 @@ class LlamaAttention(nn.Module):
+                 forward_batch=forward_batch,
+             )
+ 
++        # TEMP DEBUG (MPK_SGLANG_DRAFTKV_DUMP): capture the draft's post-rope K/V
++        # (write-side compare). The draft uses this LlamaAttention; we lock onto
++        # the first forward whose input_ids carry real prompt tokens (>= prompt_
++        # len), capture the real-token rows. v is pre-cache (post qkv split).
++        import os as _oskv
++        _kvdbg = _oskv.environ.get("MPK_SGLANG_DRAFTKV_DUMP")
++        if _kvdbg is not None:
++            try:
++                import torch as _tkv
++                _g = globals()
++                _st = _g.setdefault("_MPK_KVCAP",
++                                    {"done": False, "rows": None})
++                _pl = int(_oskv.environ.get("MPK_SGLANG_PROMPT_LEN", "39"))
++                _ii = getattr(forward_batch, "input_ids", None)
++                if (not _st["done"] and _ii is not None
++                        and k.shape[0] >= _pl):
++                    _idl = _ii.detach().cpu().tolist()
++                    _rows = [i for i, t in enumerate(_idl) if t != 0]
++                    if len(_rows) >= _pl:
++                        _r = _rows[:_pl]
++                        _hd = self.head_dim
++                        _kk = k[_r].detach().float().cpu().view(_pl, -1, _hd)
++                        _vv = v[_r].detach().float().cpu().view(_pl, -1, _hd)
++                        _pos = positions.detach().cpu().tolist()
++                        _posr = [_pos[i] for i in _r]
++                        _tkv.save({"k": _kk, "v": _vv, "prompt_len": _pl,
++                                   "ids": [_idl[i] for i in _r],
++                                   "positions": _posr}, _kvdbg)
++                        _st["done"] = True
++                        print(f"[sglang-draftkv] wrote {_kvdbg} k {tuple(_kk.shape)} "
++                              f"ids[:6]={[_idl[i] for i in _r[:6]]} "
++                              f"positions[:6]={_posr[:6]}", flush=True)
++            except Exception as _e:
++                print(f"[sglang-draftkv] err {_e}", flush=True)
++
+         attn_output = self.attn(q, k, v, forward_batch)
+         output, _ = self.o_proj(attn_output)
+         return output
+diff --git a/python/sglang/srt/models/llama_eagle3.py b/python/sglang/srt/models/llama_eagle3.py
+index 0bff63788e..23388625fd 100644
+--- a/python/sglang/srt/models/llama_eagle3.py
++++ b/python/sglang/srt/models/llama_eagle3.py
+@@ -93,8 +93,40 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
+             forward_batch=forward_batch,
+         )
+ 
++        # TEMP DEBUG (MPK_SGLANG_DRAFT_DUMP): stash draft-layer internals for
++        # the real prefill rows. self_attn output here = post-o_proj, pre-residual
++        # (~MPK attn after o_proj). Stash into a module global for the model
++        # forward's draft-dump to merge.
++        import os as _os3
++        if _os3.environ.get("MPK_SGLANG_DRAFT_DUMP") is not None:
++            try:
++                _pl = int(_os3.environ.get("MPK_SGLANG_PROMPT_LEN", "39"))
++                _ii = getattr(forward_batch, "input_ids", None)
++                _idl = _ii.detach().cpu().tolist() if _ii is not None else []
++                _rows = [i for i, t in enumerate(_idl) if t != 0][:_pl]
++                if len(_rows) >= _pl:
++                    g = globals().setdefault("_MPK_DRAFT_INTERNAL", {})
++                    g["attn_postoproj"] = hidden_states[_rows].detach().float().cpu()
++            except Exception:
++                pass
++
+         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+ 
++        if _os3.environ.get("MPK_SGLANG_DRAFT_DUMP") is not None:
++            try:
++                _pl = int(_os3.environ.get("MPK_SGLANG_PROMPT_LEN", "39"))
++                _ii = getattr(forward_batch, "input_ids", None)
++                _idl = _ii.detach().cpu().tolist() if _ii is not None else []
++                _rows = [i for i, t in enumerate(_idl) if t != 0][:_pl]
++                if len(_rows) >= _pl:
++                    g = globals().setdefault("_MPK_DRAFT_INTERNAL", {})
++                    # post_attn_ln output = residual stream after attn (= hidden+resid)
++                    _pa = (hidden_states if residual is None
++                           else hidden_states + residual)
++                    g["post_attn_ln"] = _pa[_rows].detach().float().cpu()
++            except Exception:
++                pass
++
+         # Fully Connected
+         hidden_states = self.mlp(hidden_states)
+ 
+@@ -182,6 +214,31 @@ class LlamaModel(nn.Module):
+             positions = forward_batch.mrope_positions
+ 
+         hidden_states = forward_batch.spec_info.hidden_states
++        # TEMP DEBUG (MPK_SGLANG_AUX_DUMP): capture the RAW concatenated 3-layer
++        # aux (pre-fc) the draft receives, at the real draft-extend prefill rows.
++        import os as _os
++        _adbg = _os.environ.get("MPK_SGLANG_AUX_DUMP")
++        if _adbg is not None:
++            try:
++                import torch as _t
++                _pl = int(_os.environ.get("MPK_SGLANG_PROMPT_LEN", "39"))
++                _ii = getattr(forward_batch, "input_ids", None)
++                _idl = _ii.detach().cpu().tolist() if _ii is not None else []
++                _rows = [i for i, t in enumerate(_idl) if t != 0]
++                _Hin = (hidden_states.shape[-1] // 3)
++                if (len(_rows) >= _pl
++                        and hidden_states.shape[-1] == _Hin * 3):
++                    _r = _rows[:_pl]
++                    _h = hidden_states[_r].detach().float().cpu()
++                    _a0, _a1, _a2 = _h.split(_Hin, dim=-1)
++                    _t.save({"aux": _t.stack([_a0, _a1, _a2], dim=0),
++                             "prompt_len": _pl,
++                             "ids": [_idl[i] for i in _r]}, _adbg)
++                    print(f"[sglang-aux] wrote {_adbg} rows={_r[:6]} "
++                          f"ids[:6]={[_idl[i] for i in _r[:6]]} "
++                          f"Hin={_Hin}", flush=True)
++            except Exception as _e:
++                print(f"[sglang-aux] err {_e}", flush=True)
+         if hidden_states.shape[-1] != embeds.shape[-1]:
+             if self.use_aux_norm and hidden_states.shape[-1] == self.hidden_size_in * 3:
+                 # Normalize each aux layer independently before fc projection.
+@@ -192,6 +249,13 @@ class LlamaModel(nn.Module):
+                 hidden_states = torch.cat((h_low, h_mid, h_high), dim=-1)
+             hidden_states = self.fc(hidden_states)
+ 
++        # TEMP DEBUG (MPK_SGLANG_DRAFT_DUMP): stash fc output for sub-step compare.
++        import os as _os2
++        _ddbg = _os2.environ.get("MPK_SGLANG_DRAFT_DUMP")
++        _dd_fc = None
++        if _ddbg is not None:
++            _dd_fc = hidden_states.detach().clone()
++
+         # idle batch
+         if hidden_states.shape[0] == 0:
+             return hidden_states, [hidden_states]
+@@ -209,6 +273,34 @@ class LlamaModel(nn.Module):
+             hidden_states, residual
+         )
+ 
++        # TEMP DEBUG: capture draft sub-steps (fc out, midlayer out=hidden+resid,
++        # norm out=hidden_states_to_logits) at the real prefill rows.
++        if _ddbg is not None:
++            try:
++                import torch as _t2
++                _pl = int(_os2.environ.get("MPK_SGLANG_PROMPT_LEN", "39"))
++                _ii = getattr(forward_batch, "input_ids", None)
++                _idl = _ii.detach().cpu().tolist() if _ii is not None else []
++                _rows = [i for i, t in enumerate(_idl) if t != 0]
++                if len(_rows) >= _pl:
++                    _r = _rows[:_pl]
++                    _mid = (hidden_states if residual is None
++                            else hidden_states + residual)
++                    _gi = globals().get("_MPK_DRAFT_INTERNAL", {})
++                    _t2.save({
++                        "fc": _dd_fc[_r].detach().float().cpu(),
++                        "midlayer": _mid[_r].detach().float().cpu(),
++                        "norm": hidden_states_to_logits[_r].detach().float().cpu(),
++                        "attn_postoproj": _gi.get("attn_postoproj"),
++                        "post_attn_ln": _gi.get("post_attn_ln"),
++                        "prompt_len": _pl,
++                        "ids": [_idl[i] for i in _r],
++                    }, _ddbg)
++                    print(f"[sglang-draft] wrote {_ddbg} rows={_r[:6]} "
++                          f"ids[:6]={[_idl[i] for i in _r[:6]]}", flush=True)
++            except Exception as _e:
++                print(f"[sglang-draft] err {_e}", flush=True)
++
+         # For draft decode, we capture the hidden state before norm
+         return hidden_states_to_logits, [hidden_states_to_aux]
+ 
+diff --git a/python/sglang/srt/models/qwen3_moe.py b/python/sglang/srt/models/qwen3_moe.py
+index f255b90fde..a45ec801a9 100644
+--- a/python/sglang/srt/models/qwen3_moe.py
++++ b/python/sglang/srt/models/qwen3_moe.py
+@@ -812,6 +812,37 @@ class Qwen3MoeDecoderLayer(nn.Module):
+         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+         **kwargs,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
++        # TEMP DEBUG (MPK_SGLANG_LAYER_DUMP): record prefill state for OUTPUT
++        # capture (done just before return). Lock onto the first prefill forward
++        # (batch size >= prompt_len) and also stash forward_batch token ids so
++        # the comparator can map rows -> token positions (sglang may reorder).
++        # Gate on the REAL prefill forward: input_ids has the prompt tokens
++        # (startup runs dummy all-zero warmup forwards of bs>=prompt_len — those
++        # must be skipped). Lock onto the first forward whose input_ids contain
++        # the prompt, and capture only the real-token rows.
++        import os as _os
++        _dbg = _os.environ.get("MPK_SGLANG_LAYER_DUMP")
++        _cap_active = False
++        if _dbg is not None and hidden_states is not None:
++            _g = globals()
++            _st = _g.setdefault(
++                "_MPK_CAP", {"layers": {}, "n": 0, "locked": False,
++                             "rows": None, "ids": None})
++            _pl = int(_os.environ.get("MPK_SGLANG_PROMPT_LEN", "39"))
++            if not _st["locked"]:
++                _ii = getattr(forward_batch, "input_ids", None)
++                if _ii is not None:
++                    _idl = _ii.detach().cpu().tolist()
++                    _rows = [i for i, t in enumerate(_idl) if t != 0]
++                    if len(_rows) >= _pl:  # this is the real prefill
++                        _st["locked"] = True
++                        _st["rows"] = _rows[:_pl]
++                        _st["ids"] = [_idl[i] for i in _st["rows"]]
++                        print(f"[sglang-LAYOUT] LOCKED real prefill: "
++                              f"nonzero_rows={len(_rows)} first_rows={_rows[:6]} "
++                              f"ids[:6]={_st['ids'][:6]}", flush=True)
++            if _st["locked"]:
++                _cap_active = True
+ 
+         hidden_states, residual = (
+             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+@@ -856,6 +887,21 @@ class Qwen3MoeDecoderLayer(nn.Module):
+                 hidden_states, residual, forward_batch
+             )
+ 
++        if _cap_active:
++            # Layer OUTPUT residual stream = hidden_states + residual (the next
++            # layer's pre-norm input). Capture ONLY the locked real-token rows
++            # (prompt positions), in prompt order. One row per layer.
++            import torch as _t
++            _out = (hidden_states if residual is None
++                    else hidden_states + residual)
++            _rows = _st["rows"]
++            if _out.shape[0] > max(_rows):
++                _sel = _out[_rows].detach().float().cpu().clone()
++                _st["layers"][_st["n"]] = _sel
++                _st["n"] += 1
++                _t.save({"layers_dict": _st["layers"], "prompt_len": _pl,
++                         "ids": _st["ids"]}, _dbg)
++
+         return hidden_states, residual
+ 
+     def op_comm_prepare_attn(
