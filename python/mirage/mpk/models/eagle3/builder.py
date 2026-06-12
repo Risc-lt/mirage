@@ -321,6 +321,13 @@ class Eagle3Builder:
             (mbt, 1), int64, "eagle3_hot_token")
         self.target_token = self._new(
             (mbt, 1), int64, "eagle3_target_token")
+        # Step-0 EXTEND embed seed: position-aware teacher-forced tokens built
+        # from argmax_out by mtp_build_embed_input (prefill rows read the real
+        # shifted prompt tokens[step+r+1]; decode rows fall back to argmax). Using
+        # raw argmax for the prefill seed embeds the main model's MISprediction at
+        # positions where greedy != prompt -> wrong embed half -> draft V cos ~0.5.
+        self.extend_embed_seed = self._new(
+            (mbt, 1), int64, "eagle3_extend_embed_seed")
         # Collection buffer for verify
         self.all_draft_ids = self._new(
             (mbt, self.num_draft_steps), int64, "eagle3_all_draft_ids")
@@ -421,8 +428,19 @@ class Eagle3Builder:
         mbt = self.mbt
         H = self.hidden_size
 
+        # Build the step-0 EXTEND embed seed: position-aware teacher-forcing.
+        # Prefill rows read the real shifted prompt (tokens[step+r+1]); decode
+        # rows fall back to seed_token (= argmax_out). Replaces the raw-argmax
+        # seed that embedded the main model's mispredictions during prefill.
+        self.mpk.mtp_build_embed_input_layer(
+            output_tokens=seed_token,
+            mtp_input_tokens=self.extend_embed_seed,
+            grid_dim=(1, 1, 1), block_dim=bd,
+            batch_size=mbt, max_seq_len=self.mpk.max_seq_length,
+        )
+
         for step in range(K):
-            draft_in_token = seed_token if step == 0 else self.target_token
+            draft_in_token = self.extend_embed_seed if step == 0 else self.target_token
             # eagle3's draft processes all mbt parallel rows; step-0 hidden is
             # the FULL projected target hidden (concat(aux)→fc = self.hidden_in,
             # produced by prepare_draft_input). NOTE: do NOT use the

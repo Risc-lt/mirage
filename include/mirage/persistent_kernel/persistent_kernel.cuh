@@ -404,6 +404,16 @@ __device__ __forceinline__ bool
           config.page_queue[page_queue_head % MPK_MAX_NUM_PAGES];
       page_queue_head++;
     }
+#ifdef MPK_SPEC_DECODE
+    // Seed the draft EXTEND span for this freshly-admitted request's first
+    // prefill chunk. A new request was NOT present in Step 1 this prepare call,
+    // so no draft span was stashed there; without this, Step 5b reads a stale
+    // ac=0 -> degenerate draft mapping and the first chunk [0, num_new) draft
+    // KV is never written (orphaned). step[new_id] is 0 here (set by init), so
+    // Step 5b computes base = 0 + num_new and the first EXTEND writes
+    // [base-ac, base) = [0, num_new).
+    config.draft_qo_indptr_buffer[next_request_id] = num_new_tokens;
+#endif
     num_tokens += num_new_tokens;
     num_pages += num_new_pages;
     num_reqs++;
@@ -457,7 +467,7 @@ __device__ __forceinline__ bool
       if (request_id == -1) {
         continue;
       }
-      int const base = config.step[request_id]; // advanced cursor = old_step+ac
+      int const base = config.step[request_id] + ac; // end of consumed chunk
       // EXTEND query rows = ac (the span just advanced over: accepted_count in
       // decode, the prefill chunk in prefill — NOT garbage new_token_nums).
       draft_qo += (ac > 0 ? ac : 1);

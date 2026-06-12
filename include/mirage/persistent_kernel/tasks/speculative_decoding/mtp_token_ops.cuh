@@ -163,6 +163,7 @@ __device__ __forceinline__ void
                                  void const *__restrict__ tokens_buffer_ptr,
                                  void const *__restrict__ output_tokens_ptr,
                                  void const *__restrict__ step_ptr,
+                                 void const *__restrict__ prompt_length_ptr,
                                  int request_id) {
   long long *__restrict__ mtp_input =
       static_cast<long long *>(mtp_input_tokens_ptr);
@@ -171,16 +172,27 @@ __device__ __forceinline__ void
   long long const *__restrict__ output_tokens =
       static_cast<long long const *>(output_tokens_ptr);
   int const *__restrict__ step = static_cast<int const *>(step_ptr);
+  int const *__restrict__ prompt_length =
+      static_cast<int const *>(prompt_length_ptr);
 
   int req = request_id;
   int cur_step = step[req];
+  int plen = prompt_length[req];
 
-  // Each thread handles multiple positions if BATCH_SIZE > blockDim.x.
+  // Position-aware teacher-forcing (eagle3 draft EXTEND seed). Row i seeds the
+  // draft for absolute sequence position cur_step+i; its embed token is the
+  // NEXT token at cur_step+i+1.
+  //   PREFILL (cur_step+i+1 < plen): the next token is the real prompt token,
+  //     so teacher-force from tokens[cur_step+i+1] for ALL rows (including the
+  //     last) — using the main model's argmax there would feed a mispredicted
+  //     token and corrupt the draft seed.
+  //   DECODE (cur_step+i+1 >= plen): no ground truth ahead; use the main
+  //     model's argmax (output_tokens[i]) as the autoregressive seed.
   for (int i = threadIdx.x; i < BATCH_SIZE; i += blockDim.x) {
+    int pos = cur_step + i + 1;
     long long val;
-    if (i < BATCH_SIZE - 1) {
-      int pos = cur_step + i + 1;
-      val = (pos < MAX_SEQ_LEN) ? tokens[req * MAX_SEQ_LEN + pos] : 0LL;
+    if (pos < plen && pos < MAX_SEQ_LEN) {
+      val = tokens[req * MAX_SEQ_LEN + pos];
     } else {
       val = output_tokens[i];
     }

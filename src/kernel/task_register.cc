@@ -4470,10 +4470,11 @@ int TaskRegister::register_mtp_build_embed_input_task(
   code.inc_indent();
   code.e(
       "kernel::mtp_build_embed_input_kernel<$, $>(", batch_size, max_seq_len);
-  code.e("    task_desc->output_ptrs[0],"); // mtp_input_tokens (output)
-  code.e("    runtime_config.tokens,");     // tokens_buffer (global)
-  code.e("    task_desc->input_ptrs[0],");  // output_tokens (main argmax)
-  code.e("    runtime_config.step,");       // step (global)
+  code.e("    task_desc->output_ptrs[0],");    // mtp_input_tokens (output)
+  code.e("    runtime_config.tokens,");        // tokens_buffer (global)
+  code.e("    task_desc->input_ptrs[0],");     // output_tokens (main argmax)
+  code.e("    runtime_config.step,");          // step (global)
+  code.e("    runtime_config.prompt_length,"); // prompt_length (global)
   code.e("    task_desc->task_metadata.request_id);");
   return register_task_variant(TASK_MTP_BUILD_EMBED_INPUT, code.to_string());
 }
