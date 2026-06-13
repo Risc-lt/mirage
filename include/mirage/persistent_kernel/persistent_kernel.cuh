@@ -467,7 +467,14 @@ __device__ __forceinline__ bool
       if (request_id == -1) {
         continue;
       }
-      int const base = config.step[request_id] + ac; // end of consumed chunk
+      // base = config.step + ac: the draft cache prefix end (base-ac=config.step
+      // = first candidate-window position P). The s==0 EXTEND writes the FULL
+      // candidate window [P, P+mbt) (not just the ac confirmed rows) so that
+      // consecutive per-iter windows TILE contiguously and no committed position
+      // is left a zero-KV hole (an ac=1 iter that wrote only [P,P+1) used to
+      // strand the next ac>=2 iter's first position). See the draft attention
+      // entry's s==0 num_tokens=mbt override, which depends on this base.
+      int const base = config.step[request_id] + ac;
       // EXTEND query rows = ac (the span just advanced over: accepted_count in
       // decode, the prefill chunk in prefill — NOT garbage new_token_nums).
       draft_qo += (ac > 0 ? ac : 1);

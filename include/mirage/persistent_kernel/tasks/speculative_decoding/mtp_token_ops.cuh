@@ -360,13 +360,18 @@ __device__ __forceinline__ void
   int ac = accepted_count[0];
   int t_id = threadIdx.x;
   if (t_id < K) {
-    // Row-0 chain → tokens[step+ac+1+t_id]. Guard against the seq bound AND
-    // the prompt region: during prefill iters (step < prompt_len) the draft
-    // produces garbage, so writes into [0, prompt_len) must be inert — same
-    // guard as mtp_verify_commit / legacy eagle3_commit (BL-20260610).
+    // LAST-lane chain → tokens[step+ac+1+t_id]. The draft is mbt-parallel; the
+    // chain that continues the decode is lane (ac-1) — the last consumed token
+    // (= the position the draft attention chains on via q_row_offset), NOT lane
+    // 0 (the first consumed token, which shifts the chain back by ac-1 and
+    // collapses the accept rate for ac>=2). ac = accepted_count == the EXTEND
+    // span in decode. Guard against the seq bound AND the prompt region: during
+    // prefill iters (step < prompt_len) the draft produces garbage, so writes
+    // into [0, prompt_len) must be inert (BL-20260610).
+    int row = ac > 0 ? ac - 1 : 0;
     int pos = cur_step + ac + 1 + t_id;
     if (pos < MAX_SEQ_LEN && pos >= prompt_len) {
-      tokens[req * MAX_SEQ_LEN + pos] = all_draft_ids[t_id];
+      tokens[req * MAX_SEQ_LEN + pos] = all_draft_ids[row * K + t_id];
     }
   }
 }

@@ -45,7 +45,7 @@ template <typename T,
           // The default 8 does NOT fit smem (MMA_ITERS_M 3->4, S_O_BUFFER
           // +32KB); to run Eagle3 (K<=5, mbt<=6) override it to 6. See the demo
           // header.
-          int MAX_TOKENS = 8>
+          int MAX_TOKENS = 6>
 __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     void const *qkv_ptr,
     void *paged_k_cache_ptr,
@@ -69,7 +69,14 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     // base + s; the target callers omit these so geometry comes from the
     // indptr.
     int num_tokens_override = -1,
-    int seq_len_override = -1) {
+    int seq_len_override = -1,
+    // DRAFT row offset (default 0 → target path unchanged). The draft DECODE
+    // step (s>=1) sets this to (ac-1) so the single-token query reads/writes
+    // the LAST EXTEND lane (position base-1), continuing the chain from the
+    // last consumed token — vllm's token_indices_to_sample = qsl[1:]-1. Without
+    // it the decode reads lane 0 (first consumed token), shifting the draft
+    // chain back by (ac-1) and collapsing the accept rate for ac>=2.
+    int q_row_offset = 0) {
   constexpr int CONSUMER_WARPGROUP_SYNC_BARRIER_ID = 6;
   constexpr int ROTARY_SYNC_BARRIER_ID = 7;
   cutlass::arch::NamedBarrier wg_barrier(
@@ -124,14 +131,14 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     int const *page_indices = paged_kv_indices_buffer_ptr + first_page_pos;
     wg_barrier.arrive_and_wait();
 
-    T const *__restrict__ d_q =
-        reinterpret_cast<T const *>(qkv_ptr) + first_token_pos * QKV_STRIDE;
+    T const *__restrict__ d_q = reinterpret_cast<T const *>(qkv_ptr) +
+                                (first_token_pos + q_row_offset) * QKV_STRIDE;
     T const *__restrict__ d_k = d_q + NUM_QO_PER_KV * HEAD_DIM;
     T const *__restrict__ d_v = d_k + HEAD_DIM;
     T *__restrict__ d_paged_k_cache = reinterpret_cast<T *>(paged_k_cache_ptr);
     T *__restrict__ d_paged_v_cache = reinterpret_cast<T *>(paged_v_cache_ptr);
-    T *__restrict__ d_output =
-        reinterpret_cast<T *>(output_ptr) + first_token_pos * O_STRIDE;
+    T *__restrict__ d_output = reinterpret_cast<T *>(output_ptr) +
+                               (first_token_pos + q_row_offset) * O_STRIDE;
 
     // DTensors' layouts
     using QDmem =
@@ -724,7 +731,7 @@ template <typename T,
           int HEAD_DIM,
           int MAX_SEQ_LEN,
           int PAGE_SIZE,
-          int MAX_TOKENS = 8>
+          int MAX_TOKENS = 6>
 __device__ __forceinline__ void
     multitoken_paged_attention_sm100_draft_task_impl(
         void const *qkv_ptr,
@@ -749,9 +756,21 @@ __device__ __forceinline__ void
   int const base = draft_step_ptr[request_id];
   int const ac = draft_qo_indptr_buffer_ptr[request_id + 1] -
                  draft_qo_indptr_buffer_ptr[request_id];
-  int const num_tokens_override = (draft_step_s == 0) ? ac : 1;
-  int const seq_len_override =
-      base + draft_step_s; // s==0 → base; s>=1 → base+s
+  // base-ac = config.step = P (first candidate-window position). s==0 EXTEND
+  // writes the FULL candidate window [P, P+mbt) rather than only the ac
+  // confirmed rows: windows then tile contiguously (each iter advances P by
+  // ac<=mbt) so no committed position is left a zero-KV hole. Content stays
+  // correct (lane i carries position P+i, written to row P+i). s>=1 DECODE is
+  // unchanged (1 query at base+s).
+  int const mbt = MPK_MAX_NUM_BATCHED_TOKENS;
+  int const num_tokens_override = (draft_step_s == 0) ? mbt : 1;
+  int const seq_len_override = (draft_step_s == 0)
+                                   ? (base - ac + mbt) // = P + mbt
+                                   : (base + draft_step_s);
+  // DECODE (s>=1) continues the chain from the LAST EXTEND lane (ac-1), the
+  // position whose next token the draft predicts. EXTEND (s==0) reads lanes
+  // [0,ac) so no offset. Mirrors vllm token_indices_to_sample = qsl[1:]-1.
+  int const q_row_offset = (draft_step_s == 0) ? 0 : (ac - 1);
   multitoken_paged_attention_sm100_task_impl<T,
                                              NUM_QO_HEADS,
                                              NUM_KV_HEADS,
@@ -780,7 +799,8 @@ __device__ __forceinline__ void
       q_eps,
       k_eps,
       num_tokens_override,
-      seq_len_override);
+      seq_len_override,
+      q_row_offset);
 }
 
 } // namespace kernel
