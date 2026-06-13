@@ -763,9 +763,16 @@ __device__ __forceinline__ void
   // correct (lane i carries position P+i, written to row P+i). s>=1 DECODE is
   // unchanged (1 query at base+s).
   int const mbt = MPK_MAX_NUM_BATCHED_TOKENS;
-  int const num_tokens_override = (draft_step_s == 0) ? mbt : 1;
+  // s==0 EXTEND writes the FULL candidate window [P, P+mbt) so windows tile and
+  // no decode position is left a zero-KV hole (the K=1 fix; also lifts K=2,3
+  // coverage). HANG GUARD: num_tokens=mbt with mbt>=5 deadlocks the attention
+  // kernel (a second MMA-M tile / barrier path; tracked separately), so for
+  // mbt>=5 (K>=4) fall back to the ac-row write (no full-window coverage, but
+  // runs). s>=1 DECODE is unchanged.
+  int const s0_nt = (mbt <= 4) ? mbt : ac;
+  int const num_tokens_override = (draft_step_s == 0) ? s0_nt : 1;
   int const seq_len_override = (draft_step_s == 0)
-                                   ? (base - ac + mbt) // = P + mbt
+                                   ? (base - ac + s0_nt) // mbt<=4: P+mbt; else P+ac=base
                                    : (base + draft_step_s);
   // DECODE (s>=1) continues the chain from the LAST EXTEND lane (ac-1), the
   // position whose next token the draft predicts. EXTEND (s==0) reads lanes
