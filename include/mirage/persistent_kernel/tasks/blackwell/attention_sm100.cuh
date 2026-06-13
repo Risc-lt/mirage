@@ -76,7 +76,13 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     // last consumed token — vllm's token_indices_to_sample = qsl[1:]-1. Without
     // it the decode reads lane 0 (first consumed token), shifting the draft
     // chain back by (ac-1) and collapsing the accept rate for ac>=2.
-    int q_row_offset = 0) {
+    int q_row_offset = 0,
+    // DRAFT: skip persisting this call's new K/V into the paged cache (the
+    // current attention still uses the in-smem new K/V, so output is unchanged;
+    // only the persistent cache is left untouched). Used for the LAST draft
+    // chain step whose speculative KV would otherwise pollute the next iter's
+    // EXTEND read and drop the first-token accept. Other callers pass false.
+    bool skip_kv_write = false) {
   constexpr int CONSUMER_WARPGROUP_SYNC_BARRIER_ID = 6;
   constexpr int ROTARY_SYNC_BARRIER_ID = 7;
   cutlass::arch::NamedBarrier wg_barrier(
@@ -444,7 +450,7 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
       wg_barrier.arrive_and_wait();
 
       // update the KV Cache
-      if (kv_tokens_to_process > 0) {
+      if (kv_tokens_to_process > 0 && !skip_kv_write) {
         int page_idx = page_indices[first_kv_token_to_process / PAGE_SIZE];
         for (int elem_idx = threadIdx.x;
              elem_idx < kv_tokens_to_process * HEAD_DIM;
@@ -778,6 +784,13 @@ __device__ __forceinline__ void
   // position whose next token the draft predicts. EXTEND (s==0) reads lanes
   // [0,ac) so no offset. Mirrors vllm token_indices_to_sample = qsl[1:]-1.
   int const q_row_offset = (draft_step_s == 0) ? 0 : (ac - 1);
+  // The LAST draft chain step (s == K-1 == mbt-2) produces speculative KV that
+  // no later step in this iter consumes and that the next iter's EXTEND
+  // re-derives; persisting it pollutes the next EXTEND read and drops the
+  // first-token accept. Skip its cache write (measured at fixed max_seq=300:
+  // K=2 82.6%->87.9%, K=3 74.0%->76.4% of vllm). K=1 (mbt==2) never fires
+  // (guard requires s>=1 and s==mbt-2==0 simultaneously).
+  bool const skip_kv_write = (draft_step_s >= 1) && (draft_step_s == (mbt - 2));
   multitoken_paged_attention_sm100_task_impl<T,
                                              NUM_QO_HEADS,
                                              NUM_KV_HEADS,
@@ -807,7 +820,8 @@ __device__ __forceinline__ void
       k_eps,
       num_tokens_override,
       seq_len_override,
-      q_row_offset);
+      q_row_offset,
+      skip_kv_write);
 }
 
 } // namespace kernel
