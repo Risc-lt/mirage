@@ -769,17 +769,26 @@ __device__ __forceinline__ void
   // correct (lane i carries position P+i, written to row P+i). s>=1 DECODE is
   // unchanged (1 query at base+s).
   int const mbt = MPK_MAX_NUM_BATCHED_TOKENS;
-  // s==0 EXTEND writes the FULL candidate window [P, P+mbt) so windows tile and
-  // no decode position is left a zero-KV hole (the K=1 fix; also lifts K=2,3
-  // coverage). HANG GUARD: num_tokens=mbt with mbt>=5 deadlocks the attention
-  // kernel (a second MMA-M tile / barrier path; tracked separately), so for
-  // mbt>=5 (K>=4) fall back to the ac-row write (no full-window coverage, but
-  // runs). s>=1 DECODE is unchanged.
-  int const s0_nt = (mbt <= 4) ? mbt : ac;
-  int const num_tokens_override = (draft_step_s == 0) ? s0_nt : 1;
-  int const seq_len_override = (draft_step_s == 0)
-                                   ? (base - ac + s0_nt) // mbt<=4: P+mbt; else P+ac=base
-                                   : (base + draft_step_s);
+  int const p_adv = base - ac; // = config.step (post-advance)
+  int num_tokens_override, seq_len_override;
+  if (mbt <= 3) {
+    // K<=2: s==0 writes the FULL candidate window [P, P+mbt) so windows tile and
+    // no decode position is left a zero-KV hole (K=1 fix; K=2 is precision-clean
+    // vs oracle, no off=0 bug). s>=1 unchanged (1 query at base+s).
+    num_tokens_override = (draft_step_s == 0) ? mbt : 1;
+    seq_len_override =
+        (draft_step_s == 0) ? (base - ac + mbt) : (base + draft_step_s);
+  } else {
+    // K>=3: the full-window scheme leaves the FIRST confirmed position (off=0) of
+    // an ac>=2 span with WRONG draft KV (verified vs oracle: 26/46 ac=2 off=0
+    // positions diverge, cos down to 0.32) — the prior iter's s>=2 chain writes
+    // pollute it. Fix: s==0 RE-DERIVES the just-confirmed span [P_adv-ac, P_adv)
+    // in place so off=0 gets correct KV; s>=1 writes the speculative chain after
+    // the prefix. (mbt>=5 also avoids the num_tokens=mbt hang since num_tokens=ac.)
+    num_tokens_override = (draft_step_s == 0) ? ac : 1;
+    seq_len_override =
+        (draft_step_s == 0) ? p_adv : (p_adv + draft_step_s);
+  }
   // DECODE (s>=1) continues the chain from the LAST EXTEND lane (ac-1), the
   // position whose next token the draft predicts. EXTEND (s==0) reads lanes
   // [0,ac) so no offset. Mirrors vllm token_indices_to_sample = qsl[1:]-1.
