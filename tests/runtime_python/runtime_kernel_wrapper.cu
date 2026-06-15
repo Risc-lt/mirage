@@ -1839,9 +1839,107 @@ void sampling_from_logits(torch::Tensor logits,
   }
 }
 
+// ---------------------------------------------------------------------------
+// mtp_verify_commit kernel wrapper (task6 regression, PR2). The merged
+// verify+commit replaced eagle3_commit and DROPPED the K>1 src_slot=0 chain
+// selection. The unit test asserts the correct post-fix behavior: the strict
+// accept-walk + confirmed-token write + accepted_count, with NO slot-selection
+// of the draft chain (the next chain is produced by the extend stage).
+// ---------------------------------------------------------------------------
+using kernel::mtp_verify_commit_kernel;
+
+// The draft chain is now read from tokens_buffer[step+1..step+K] (the prev
+// iter's mtp_draft_token_copy placed it there). The wrapper seeds it there from
+// the test's draft_token_ids before invoking the kernel, then runs the kernel
+// (which no longer takes a separate draft_token_ids input).
+template <int K, int MAX_SEQ_LEN>
+__global__ void
+    mtp_verify_commit_kernel_wrapper(void const *draft_token_ids_ptr,
+                                     void const *argmax_out_ptr,
+                                     void const *step_ptr,
+                                     void const *prompt_length_ptr,
+                                     void *tokens_buffer_ptr,
+                                     void *new_token_nums_ptr,
+                                     void *accepted_count_out_ptr,
+                                     void *accept_hist_ptr,
+                                     int request_id) {
+  // Seed the draft chain into tokens[req*MAX_SEQ_LEN + step + 1 + i] (single
+  // thread; the kernel below reads exactly these positions in its accept-walk).
+  if (threadIdx.x == 0) {
+    long long const *draft_ids =
+        static_cast<long long const *>(draft_token_ids_ptr);
+    long long *tokens = static_cast<long long *>(tokens_buffer_ptr);
+    int const *step = static_cast<int const *>(step_ptr);
+    int cur_step = step[request_id];
+    for (int i = 0; i < K; i++) {
+      tokens[request_id * MAX_SEQ_LEN + cur_step + 1 + i] = draft_ids[i];
+    }
+  }
+  __syncthreads();
+  mtp_verify_commit_kernel<K, MAX_SEQ_LEN>(argmax_out_ptr,
+                                           step_ptr,
+                                           prompt_length_ptr,
+                                           tokens_buffer_ptr,
+                                           new_token_nums_ptr,
+                                           accepted_count_out_ptr,
+                                           accept_hist_ptr,
+                                           request_id);
+}
+
+void mtp_verify_commit(torch::Tensor draft_token_ids, // [K] i64
+                       torch::Tensor argmax_out,      // [K+1] i64
+                       torch::Tensor step,            // [MAX_REQ] i32
+                       torch::Tensor prompt_length,   // [MAX_REQ] i32
+                       torch::Tensor tokens_buffer,   // [MAX_REQ,MAX_SEQ] i64
+                       torch::Tensor new_token_nums,  // [MAX_REQ] i32
+                       torch::Tensor accepted_count_out, // [1] i32
+                       torch::Tensor accept_hist,        // [K+2] i32
+                       int K,
+                       int max_seq_len,
+                       int request_id) {
+  dim3 grid_dim(1, 1, 1);
+  dim3 block_dim(32, 1, 1);
+#define LAUNCH_VC(K_, MSL_)                                                    \
+  mtp_verify_commit_kernel_wrapper<K_, MSL_>                                   \
+      <<<grid_dim, block_dim>>>(draft_token_ids.data_ptr(),                    \
+                                argmax_out.data_ptr(),                         \
+                                step.data_ptr(),                               \
+                                prompt_length.data_ptr(),                      \
+                                tokens_buffer.data_ptr(),                      \
+                                new_token_nums.data_ptr(),                     \
+                                accepted_count_out.data_ptr(),                 \
+                                accept_hist.data_ptr(),                        \
+                                request_id)
+  // Test matrix needs K in {1,2,3}, MAX_SEQ_LEN=512.
+  if (max_seq_len == 512) {
+    if (K == 1) {
+      LAUNCH_VC(1, 512);
+    } else if (K == 2) {
+      LAUNCH_VC(2, 512);
+    } else if (K == 3) {
+      LAUNCH_VC(3, 512);
+    } else {
+      printf("mtp_verify_commit: unsupported K=%d\n", K);
+    }
+  } else {
+    printf("mtp_verify_commit: unsupported max_seq_len=%d (test uses 512)\n",
+           max_seq_len);
+  }
+#undef LAUNCH_VC
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    printf("CUDA mtp_verify_commit launch error: %s\n",
+           cudaGetErrorString(err));
+  }
+}
+
 // pybind11 bindings
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def(
+      "mtp_verify_commit",
+      &mtp_verify_commit,
+      "MTP merged verify+commit (strict accept-walk + confirmed-token write)");
   // m.def("prompt_lookup", &prompt_lookup, "Prompt lookup kernel");
   // m.def("embedding", &embedding, "Embedding kernel");
   // m.def("linear", &linear, "Linear kernel");

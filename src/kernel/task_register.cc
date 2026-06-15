@@ -1911,9 +1911,7 @@ int TaskRegister::register_paged_attention_sm100_task(
   // params[3]: rotary_emd
   // params[4]: max_seq_len
   // params[5]: page_size
-  // params[6]: q_len_override (optional, default 0)
-  // params[7]: tail_offset    (optional, default 0)
-  assert(params.size() == 6 || params.size() == 8);
+  assert(params.size() == 6);
   std::vector<tb::TBInputOp *> input_ops;
   std::vector<tb::TBInputOp *> output_ops;
   int num_inputs = 7;
@@ -1938,8 +1936,6 @@ int TaskRegister::register_paged_attention_sm100_task(
   int kv_stride = head_dim * num_kv_heads;
   int max_seq_len = params[4];
   int page_size = params[5];
-  int q_len_override = (params.size() >= 7) ? params[6] : 0;
-  int tail_offset = (params.size() >= 8) ? params[7] : 0;
   // Assert that k_cache has the same head_dim
   assert(input_ops[1]->output_tensors[0].num_dims == 4);
   assert(head_dim == input_ops[1]->output_tensors[0].dim[3]);
@@ -1948,10 +1944,11 @@ int TaskRegister::register_paged_attention_sm100_task(
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  // Pass Q_LEN_OVERRIDE, TAIL_OFFSET, and MAX_TOKENS explicitly.
+  // Pass MAX_TOKENS explicitly (Q_LEN_OVERRIDE/TAIL_OFFSET removed: the draft
+  // now uses its own per-step mapping; num_tokens/seq_len derive from indptr).
   code.e("kernel::multitoken_paged_attention_sm100_task_impl<bfloat16, $, $, "
          "$, $, "
-         "$, $, $, $, $, $, $>(",
+         "$, $, $, $, $>(",
          num_q_heads / num_kv_heads,
          1,
          kv_stride,
@@ -1960,8 +1957,6 @@ int TaskRegister::register_paged_attention_sm100_task(
          head_dim,
          max_seq_len,
          page_size,
-         q_len_override,
-         tail_offset,
          max_tokens);
   code.e("    task_desc->input_ptrs[0],");
   code.e("    task_desc->input_ptrs[1],");
@@ -1981,6 +1976,87 @@ int TaskRegister::register_paged_attention_sm100_task(
   code.e("    1e-6f,");
   code.e("    1e-6f);");
   return register_task_variant(TASK_ATTN_SM100, code.to_string());
+}
+
+int TaskRegister::register_paged_attention_sm100_draft_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // PR3: identical to register_paged_attention_sm100_task EXCEPT it reads the
+  // DRAFT KV mapping (runtime_config.draft_qo_indptr_buffer / draft_paged_kv_*)
+  // instead of the global target mapping. This is the read-side fix for the
+  // accept-collapse: the draft must attend its own cache with the correct
+  // attend-range/seq_len + in-kernel rope offset, not the target's K+1
+  // geometry. params[6] = draft inner step s (compile-time DRAFT_STEP_S): s==0
+  // EXTEND (q_len=ac, seq_len=base); s>=1 DECODE (q_len=1, seq_len=base+s).
+  assert(params.size() == 7);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 7;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  int max_tokens = input_ops[0]->dtensor.dim[0];
+  int qkv_stride = input_ops[0]->dtensor.dim[1];
+  int output_size = output_ops[0]->dtensor.dim[1];
+  int num_q_heads = params[0];
+  int num_kv_heads = params[1];
+  int head_dim = output_size / num_q_heads;
+  int kv_stride = head_dim * num_kv_heads;
+  int max_seq_len = params[4];
+  int page_size = params[5];
+  int draft_step_s = params[6]; // compile-time DRAFT_STEP_S
+  assert(input_ops[1]->output_tensors[0].num_dims == 4);
+  assert(head_dim == input_ops[1]->output_tensors[0].dim[3]);
+  assert(input_ops[2]->output_tensors[0].num_dims == 4);
+  assert(head_dim == input_ops[2]->output_tensors[0].dim[3]);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  // Independent DRAFT entry: reads the draft mapping + draft_step (base) and
+  // the runtime inner-step s (params[6]); derives per-step (num_tokens,
+  // seq_len).
+  code.e(
+      "kernel::multitoken_paged_attention_sm100_draft_task_impl<bfloat16, $, "
+      "$, $, $, "
+      "$, $, $, $, $>(",
+      num_q_heads / num_kv_heads,
+      1,
+      kv_stride,
+      qkv_stride,
+      output_size,
+      head_dim,
+      max_seq_len,
+      page_size,
+      max_tokens);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->input_ptrs[2],");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    runtime_config.draft_qo_indptr_buffer,");        // DRAFT mapping
+  code.e("    runtime_config.draft_paged_kv_indptr_buffer,");  // DRAFT mapping
+  code.e("    runtime_config.draft_paged_kv_indices_buffer,"); // DRAFT mapping
+  code.e("    runtime_config.draft_paged_kv_last_page_len_buffer,"); // DRAFT
+                                                                     // mapping
+  code.e("    runtime_config.draft_step,"); // base = step+ac (per req)
+  code.e("    $,", draft_step_s);           // inner draft step s
+  code.e("    task_desc->task_metadata.request_id,");
+  code.e("    $,", params[2] > 0);
+  code.e("    $,", params[3] > 0);
+  code.e("    task_desc->input_ptrs[3],");
+  code.e("    task_desc->input_ptrs[4],");
+  code.e("    task_desc->input_ptrs[5],");
+  code.e("    task_desc->input_ptrs[6],");
+  code.e("    1e-6f,");
+  code.e("    1e-6f);");
+  return register_task_variant(TASK_ATTN_SM100_DRAFT, code.to_string());
 }
 
 int TaskRegister::register_argmax_partial_sm100_task(
@@ -4394,10 +4470,11 @@ int TaskRegister::register_mtp_build_embed_input_task(
   code.inc_indent();
   code.e(
       "kernel::mtp_build_embed_input_kernel<$, $>(", batch_size, max_seq_len);
-  code.e("    task_desc->output_ptrs[0],"); // mtp_input_tokens (output)
-  code.e("    runtime_config.tokens,");     // tokens_buffer (global)
-  code.e("    task_desc->input_ptrs[0],");  // output_tokens (main argmax)
-  code.e("    runtime_config.step,");       // step (global)
+  code.e("    task_desc->output_ptrs[0],");    // mtp_input_tokens (output)
+  code.e("    runtime_config.tokens,");        // tokens_buffer (global)
+  code.e("    task_desc->input_ptrs[0],");     // output_tokens (main argmax)
+  code.e("    runtime_config.step,");          // step (global)
+  code.e("    runtime_config.prompt_length,"); // prompt_length (global)
   code.e("    task_desc->task_metadata.request_id);");
   return register_task_variant(TASK_MTP_BUILD_EMBED_INPUT, code.to_string());
 }
@@ -4417,6 +4494,30 @@ int TaskRegister::register_copy_task(threadblock::Graph const &bgraph,
   code.e("    task_desc->input_ptrs[0],");   // src
   code.e("    task_desc->output_ptrs[0]);"); // dst
   return register_task_variant(TASK_COPY, code.to_string());
+}
+
+int TaskRegister::register_layer_capture_task(threadblock::Graph const &bgraph,
+                                              std::vector<int> const &params) {
+  // DEBUG: params[0]=hidden_dim, params[1]=max_seq_len,
+  // params[2]=num_rows(mbt). Capture src[num_rows,hidden] into dst[step ..
+  // step+num_rows) (step from the runtime global), so a prefill chunk's mbt
+  // positions all land correctly.
+  assert(params.size() == 3);
+  int hidden_dim = params[0];
+  int max_seq_len = params[1];
+  int num_rows = params[2];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::layer_capture_kernel<bfloat16, $, $, $>(",
+         hidden_dim,
+         max_seq_len,
+         num_rows);
+  code.e("    task_desc->input_ptrs[0],");             // src
+  code.e("    runtime_config.step,");                  // step (global)
+  code.e("    task_desc->output_ptrs[0],");            // dst persistent buffer
+  code.e("    task_desc->task_metadata.request_id);"); // request_id
+  return register_task_variant(TASK_LAYER_CAPTURE, code.to_string());
 }
 
 int TaskRegister::register_concat_task(threadblock::Graph const &bgraph,
@@ -4454,33 +4555,69 @@ int TaskRegister::register_eagle3_d2t_remap_task(
   return register_task_variant(TASK_EAGLE3_D2T_REMAP, code.to_string());
 }
 
-int TaskRegister::register_eagle3_commit_task(threadblock::Graph const &bgraph,
-                                              std::vector<int> const &params) {
-  // params[0]: K (= num_draft_steps), params[1]: batch_size,
-  // params[2]: max_seq_len
-  // Matches mtp_prepare_verify pattern: tokens_buffer / step as INPUT
-  // (kernel writes through them), num_new_tokens as OUTPUT.
-  assert(params.size() == 3);
+int TaskRegister::register_mtp_verify_commit_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: K (= num_draft_steps), params[1]: max_seq_len
+  // Merged verify+commit for the draft-extend path. Inputs: argmax_out,
+  // tokens_buffer (write-through; ALSO supplies the draft chain at
+  // [step+1..step+K], written by mtp_draft_token_copy), accept_hist
+  // (attach_input). Outputs: new_token_nums, accepted_count_out.
+  // step/prompt_length are globals.
+  assert(params.size() == 2);
   int K = params[0];
-  int batch_size = params[1];
-  int max_seq_len = params[2];
+  int max_seq_len = params[1];
 
   mirage::transpiler::CodeKeeper code;
   code.inc_indent();
-  code.e("kernel::eagle3_commit_kernel<$, $, $>(", K, batch_size, max_seq_len);
-  code.e("    task_desc->input_ptrs[3],"); // tokens_buffer
-  code.e("    task_desc->input_ptrs[0],"); // target_argmax (from argmax_reduce)
-  code.e("    task_desc->input_ptrs[1],"); // draft_tokens_new (from scatter)
-  code.e(
-      "    task_desc->input_ptrs[2],"); // accepted_count (from verify_strict)
-  code.e("    runtime_config.step,");   // step (global)
+  code.e("kernel::mtp_verify_commit_kernel<$, $>(", K, max_seq_len);
+  code.e("    task_desc->input_ptrs[0],");     // argmax_out (K+1)
+  code.e("    runtime_config.step,");          // step (global)
   code.e("    runtime_config.prompt_length,"); // prompt_length (global)
+  code.e("    task_desc->input_ptrs[1],");     // tokens_buffer (write-thru)
   code.e("    task_desc->output_ptrs[0],");    // new_token_nums
-  code.e(
-      "    task_desc->output_ptrs[1],"); // drafts_prev (attach_input snapshot)
-  code.e("    task_desc->input_ptrs[4],"); // accept_hist (attach_input; debug)
+  code.e("    task_desc->output_ptrs[1],");    // accepted_count_out
+  code.e("    task_desc->input_ptrs[2],");     // accept_hist (attach_input)
   code.e("    task_desc->task_metadata.request_id);"); // request_id
-  return register_task_variant(TASK_EAGLE3_COMMIT, code.to_string());
+  return register_task_variant(TASK_MTP_VERIFY_COMMIT, code.to_string());
+}
+
+int TaskRegister::register_hidden_gather_accepted_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: K (= num_draft_steps), params[1]: hidden_dim
+  assert(params.size() == 2);
+  int K = params[0];
+  int hidden_dim = params[1];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e(
+      "kernel::hidden_gather_accepted_kernel<bfloat16, $, $>(", K, hidden_dim);
+  code.e("    task_desc->input_ptrs[0],");   // verify_hidden [K+1, H]
+  code.e("    task_desc->input_ptrs[1],");   // accepted_count (in-graph)
+  code.e("    task_desc->output_ptrs[0]);"); // extend_seed [K+1, H]
+  return register_task_variant(TASK_HIDDEN_GATHER_ACCEPTED, code.to_string());
+}
+
+int TaskRegister::register_mtp_draft_token_copy_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: K (= num_draft_steps), params[1]: max_seq_len
+  // Copies all_draft_ids row-0 → tokens[step+ac+1..step+ac+K] for next iter's
+  // verify. Inputs: all_draft_ids, accepted_count. Output: tokens_buffer
+  // (write-through; attach_input cross-iter carrier). step is a global.
+  assert(params.size() == 2);
+  int K = params[0];
+  int max_seq_len = params[1];
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::mtp_draft_token_copy_kernel<$, $>(", K, max_seq_len);
+  code.e("    task_desc->input_ptrs[0],");     // all_draft_ids [mbt, K]
+  code.e("    runtime_config.step,");          // step (global)
+  code.e("    runtime_config.prompt_length,"); // prompt_length (global)
+  code.e("    task_desc->input_ptrs[1],");     // accepted_count (in-graph)
+  code.e("    task_desc->output_ptrs[0],");    // tokens_buffer (write-thru)
+  code.e("    task_desc->task_metadata.request_id);"); // request_id
+  return register_task_variant(TASK_MTP_DRAFT_TOKEN_COPY, code.to_string());
 }
 
 // ============ MLA-MTP TP variants (ferret-derived, no-PDL) ============

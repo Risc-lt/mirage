@@ -337,7 +337,8 @@ void register_mugraph(
                 (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_SM100) ||
                 (TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100) ||
                 (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER) ||
-                (task_type == TASK_ATTN_SM100)) {
+                (task_type == TASK_ATTN_SM100) ||
+                (task_type == TASK_ATTN_SM100_DRAFT)) {
               // Note that we assume grid_dim.x corresponds to
               // the request dimension
               task.task_metadata.request_id = bid.x;
@@ -1792,6 +1793,7 @@ TaskGraphResult print_task_graph(
       "TASK_LINEAR_WITH_RESIDUAL_SM100";
   task_type_to_name[TASK_SPLITK_LINEAR_SM100] = "TASK_SPLITK_LINEAR_SM100";
   task_type_to_name[TASK_ATTN_SM100] = "TASK_ATTN_SM100";
+  task_type_to_name[TASK_ATTN_SM100_DRAFT] = "TASK_ATTN_SM100_DRAFT";
   task_type_to_name[TASK_ARGMAX_PARTIAL_SM100] = "TASK_ARGMAX_PARTIAL_SM100";
   task_type_to_name[TASK_ARGMAX_REDUCE_SM100] = "TASK_ARGMAX_REDUCE_SM100";
   task_type_to_name[TASK_SAMPLING_SM100] = "TASK_SAMPLING_SM100";
@@ -1822,9 +1824,13 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_MTP_PREPARE_VERIFY] = "TASK_MTP_PREPARE_VERIFY";
   task_type_to_name[TASK_MTP_BUILD_EMBED_INPUT] = "TASK_MTP_BUILD_EMBED_INPUT";
   task_type_to_name[TASK_COPY] = "TASK_COPY";
+  task_type_to_name[TASK_LAYER_CAPTURE] = "TASK_LAYER_CAPTURE";
   task_type_to_name[TASK_CONCAT] = "TASK_CONCAT";
   task_type_to_name[TASK_EAGLE3_D2T_REMAP] = "TASK_EAGLE3_D2T_REMAP";
-  task_type_to_name[TASK_EAGLE3_COMMIT] = "TASK_EAGLE3_COMMIT";
+  task_type_to_name[TASK_MTP_VERIFY_COMMIT] = "TASK_MTP_VERIFY_COMMIT";
+  task_type_to_name[TASK_HIDDEN_GATHER_ACCEPTED] =
+      "TASK_HIDDEN_GATHER_ACCEPTED";
+  task_type_to_name[TASK_MTP_DRAFT_TOKEN_COPY] = "TASK_MTP_DRAFT_TOKEN_COPY";
   task_type_to_name[TASK_QUANTIZE_FP8_SM100] = "TASK_QUANTIZE_FP8_SM100";
   task_type_to_name[TASK_LINEAR_FP8_SM100] = "TASK_LINEAR_FP8_SM100";
   task_type_to_name[TASK_LINEAR_FP8_WITH_RESIDUAL_SM100] =

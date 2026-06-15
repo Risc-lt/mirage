@@ -31,10 +31,55 @@ def _load_draft_state_dict(path: str) -> dict:
     return state_dict
 
 
+def _is_speculators_format(config: dict) -> bool:
+    """RedHatAI/speculators-library eagle3 checkpoints use a different layout
+    than the SpecForge `midlayer.`-prefixed format MPK's builder expects."""
+    return (config.get("speculators_model_type") == "eagle3"
+            or "speculators_config" in config
+            or "transformer_layer_config" in config)
+
+
+def _adapt_speculators_eagle3(state_dict: dict, config: dict):
+    """Convert a speculators-library eagle3 checkpoint (e.g.
+    RedHatAI/Qwen3-30B-A3B-Instruct-2507-speculator.eagle3) into the
+    (`midlayer.`-prefixed state_dict, flat config) form Eagle3Builder expects.
+
+    Key remap: the single transformer layer is stored under `layers.0.` in the
+    speculators format vs `midlayer.` in SpecForge. Top-level tensors
+    (fc.weight, d2t, lm_head.weight, norm.weight) keep their names. The draft's
+    own `embed_tokens.weight` and `t2d` are unused by MPK (the target embedding
+    is shared via target_w_embed; only d2t is needed) and are dropped.
+
+    Config flatten: dims live under `transformer_layer_config`; draft_vocab_size
+    is top-level. Lift to the flat keys the builder reads.
+    """
+    # --- state_dict key remap ---
+    new_sd = {}
+    for k, v in state_dict.items():
+        if k.startswith("layers.0."):
+            new_sd["midlayer." + k[len("layers.0."):]] = v
+        elif k in ("embed_tokens.weight", "t2d"):
+            continue  # unused by MPK
+        else:
+            new_sd[k] = v  # fc.weight, d2t, lm_head.weight, norm.weight
+
+    # --- config flatten ---
+    tlc = config.get("transformer_layer_config", {})
+    flat = dict(config)
+    for key in ("hidden_size", "intermediate_size", "num_attention_heads",
+                "num_key_value_heads", "head_dim", "rms_norm_eps"):
+        if key in tlc:
+            flat[key] = tlc[key]
+    # draft_vocab_size is already top-level in the speculators config.
+    assert "draft_vocab_size" in flat, (
+        "speculators eagle3 config missing draft_vocab_size")
+    return new_sd, flat
+
+
 class Eagle3Builder:
     """Build the Eagle3 draft + verify portion of a target model's task graph.
 
-    Usage from a target builder / demo:
+    Usage from a target builder / demo (draft-extend pipeline, PR2):
 
         eagle3 = Eagle3Builder(
             mpk=mpk, draft_state_dict=sd, draft_config=cfg,
@@ -43,16 +88,16 @@ class Eagle3Builder:
             cos_pos_embed=cos_dt, sin_pos_embed=sin_dt,
             num_draft_steps=4,
         )
-        eagle3.build_draft_loop(
-            aux_h0=aux_h0_dtensor, aux_h1=..., aux_h2=...,
-            target_argmax_token=argmax_out_dtensor,
-        )
-        # eagle3.all_draft_ids holds the per-step draft token IDs for verify
+        # Per decode iter (after the target verify forward):
+        #   mpk.mtp_verify_commit_layer(...)            # verify + commit
+        #   eagle3.prepare_draft_input(aux_h0,h1,h2, accepted_count)
+        #   eagle3.build_draft_extend(seed_token, accepted_count)
+        #   mpk.mtp_draft_token_copy_layer(all_draft_ids, accepted_count, tokens)
+        # eagle3.all_draft_ids holds the per-step draft token IDs for verify.
 
-    After build_draft_loop the caller wires `eagle3.all_draft_ids` and
-    `mpk.meta_tensors['output_tokens']` (target argmax) into the MTP verify
-    pipeline (mtp_prepare_verify_layer → mtp_verify_strict_layer →
-    mtp_accept_commit_layer).
+    The legacy build_draft_loop / eagle3_commit (q_len_override KV-chain) design
+    was removed in PR2; mtp_verify_commit + prepare_draft_input +
+    build_draft_extend + mtp_draft_token_copy replace it.
     """
 
     def __init__(
@@ -152,14 +197,26 @@ class Eagle3Builder:
         self._fc_w = fc.contiguous()
         self._kept_tensors.append(self._fc_w)
 
-        # lm_head. Eagle3 uses hot vocab head; size 32000.
-        # Pad rows to make per-task output 16B-aligned so cuTensorMapEncodeTiled
-        # accepts the OUTPUT TMA descriptor. 32000 → 32256 (= 96 × 336 elements);
+        # lm_head. Eagle3 uses a hot vocab head (32000 for SpecForge, 64000 for
+        # the RedHatAI speculator). The padded row count must match the
+        # lm_head linear's output-task grid rule (grid_for_rmsnorm_linear_layer):
+        #   - size/96 <= 400 (e.g. 32000): pad to a 96-multiple → 32256 (=96*336),
+        #     making the per-task output 16B-aligned for cuTensorMapEncodeTiled.
+        #   - size/96 > 400 (e.g. 64000): the large-output path requires
+        #     size % 256 == 0 and tiles by 256; 64000 = 256*250 is already
+        #     aligned, so no padding is needed.
         lm = sd["lm_head.weight"]
         assert lm.shape == (self.draft_vocab_size, self.hidden_size)
-        self._padded_draft_vocab = 32256
-        assert self._padded_draft_vocab % 96 == 0, (
-            f"padded_draft_vocab {self._padded_draft_vocab} must be 96-aligned")
+        if self.draft_vocab_size / 96 > 400:
+            assert self.draft_vocab_size % 256 == 0, (
+                f"large draft_vocab_size {self.draft_vocab_size} must be "
+                f"256-aligned for the linear large-output path")
+            self._padded_draft_vocab = self.draft_vocab_size
+        else:
+            self._padded_draft_vocab = 32256
+            assert self._padded_draft_vocab % 96 == 0, (
+                f"padded_draft_vocab {self._padded_draft_vocab} must be "
+                f"96-aligned")
         pad_rows = self._padded_draft_vocab - self.draft_vocab_size
         if pad_rows > 0:
             self._lm_head_w = torch.cat(
@@ -264,188 +321,228 @@ class Eagle3Builder:
             (mbt, 1), int64, "eagle3_hot_token")
         self.target_token = self._new(
             (mbt, 1), int64, "eagle3_target_token")
+        # Step-0 EXTEND embed seed: position-aware teacher-forced tokens built
+        # from argmax_out by mtp_build_embed_input (prefill rows read the real
+        # shifted prompt tokens[step+r+1]; decode rows fall back to argmax). Using
+        # raw argmax for the prefill seed embeds the main model's MISprediction at
+        # positions where greedy != prompt -> wrong embed half -> draft V cos ~0.5.
+        self.extend_embed_seed = self._new(
+            (mbt, 1), int64, "eagle3_extend_embed_seed")
         # Collection buffer for verify
         self.all_draft_ids = self._new(
             (mbt, self.num_draft_steps), int64, "eagle3_all_draft_ids")
+        # Draft-extend (PR2): prepared seed hidden = target hidden (post-fc) at
+        # accepted positions, produced by prepare_draft_input, consumed by
+        # _build_draft_extend's step 0. Rows [accepted_count..] are zero-filled.
+        self.extend_seed_hidden = self._new(
+            (mbt, H), bfloat16, "eagle3_extend_seed_hidden")
 
-    def build_draft_loop(
-        self,
-        aux_h0,      # DTensor, target hidden at capture layer 0
-        aux_h1,
-        aux_h2,
-        target_argmax_token,  # DTensor (mbt, 1) int64 — main's argmax
-        accepted_count,       # DTensor (mbt, 1) int32 — verify_strict output
-                              # (kept in signature for demo compat; not used
-                              # by the paged_attention path)
-    ):
-        """Register the Eagle3 draft loop tasks on self.mpk's graph.
+    # ======================================================================
+    # Draft-extend pipeline (PR2): target decode → mtp_verify_commit →
+    # prepare_draft_input → _build_draft_extend → draft decode.
+    #
+    # prepare_draft_input is the single model-specific INPUT-INTEGRATION seam
+    # (gather accepted-position hidden + concat + projection). _build_draft_extend
+    # is general ("draft does a prefill on the prepared input"); the attention
+    # sub-step is pluggable (eagle3/qwen3 → GQA paged_attention_layer here;
+    # DeepSeek MTP → MLA in PR4). The eagle3 GQA path uses the DRAFT KV mapping
+    # (PR1's draft_* buffers), with NO Q_LEN_OVERRIDE/TAIL_OFFSET — the draft has
+    # its own per-step mapping advanced by mtp_build_draft_indptr.
+    #
+    # NOTE: build_draft_loop (the legacy q_len_override path) is retained for
+    # K=1 bit-stability comparison until this path is validated end-to-end.
+    # ======================================================================
+    def prepare_draft_input(self, aux_h0, aux_h1, aux_h2, accepted_count):
+        """Integrate the draft's step-0 input AFTER verify, BEFORE extend.
 
-        Uses MPK's paged_attention_layer:
-          - K=1: writes mbt K/Vs at [step, step+mbt)
-          - K>1: passes q_len_override=1 + tail_offset=K-1-step so step k
-            writes exactly 1 K/V at absolute position [step+k]. The K draft
-            steps are serialized through the natural compute chain (step k+1
-            embeds step k's d2t-remapped token), so each step's attention
-            sees all prior steps' K/V writes via release/acquire fences.
+        eagle3: concat(aux_h0,h1,h2) → w_fc (3H→H) → self.hidden_in, the full
+        mbt-row projected target hidden that seeds build_draft_extend's step 0.
 
-        Inputs are kernel-level DTensors produced earlier in the target graph.
-        After this returns, self.all_draft_ids contains the K draft tokens per
-        request (each in target-vocab space, after d2t remap), ready for the
-        MTP verify pipeline.
+        NOTE: eagle3's draft is mbt-PARALLEL — all mbt rows carry valid target
+        hidden, so we do NOT route the seed through hidden_gather_accepted (which
+        zeros rows >= accepted_count): that both collapses the accept rate AND
+        makes hidden_in a fork-producer (gather + extend both consume it) →
+        build_annotated_graph case-3 crash. The accepted-row gather is the
+        DeepSeek single-chain MTP formulation (PR4), where hidden_gather_accepted
+        + extend_seed_hidden are used; for eagle3 the extend reads hidden_in
+        directly. (accepted_count is consumed by mtp_verify_commit; the draft
+        mapping advance uses it via mtp_build_draft_indptr — not needed for the
+        eagle3 mbt-parallel seed.)
         """
-        self._prepare_weights()
-        self._attach_weights()
-        self._allocate_intermediates()
+        bd = (256, 1, 1) if self.mpk.target_cc >= 90 else (128, 1, 1)
+        # concat aux hiddens → fc (the eagle3 "target hidden" projection).
+        self.mpk.concat_layer(
+            inputs=[aux_h0, aux_h1, aux_h2],
+            output=self.aux_concat_out,
+            grid_dim=(1, 1, 1), block_dim=bd,
+        )
+        self.mpk.linear_layer(
+            input=self.aux_concat_out, weight=self.w_fc,
+            output=self.hidden_in,
+            grid_dim=(grid_for_rmsnorm_linear_layer(self.w_fc.dim(0)), 1, 1),
+            block_dim=bd,
+        )
+        return self.hidden_in
 
+    def _gqa_attn(self, attn_in, attn_out, bd, s):
+        """Pluggable attention sub-step for the eagle3/qwen3 draft (GQA).
+
+        Uses the DRAFT KV mapping. s = inner draft step (runtime arg): s==0
+        EXTEND (q_len=ac, seq_len=base), s>=1 DECODE (q_len=1, seq_len=base+s).
+        For DeepSeek (PR4) a _mla_attn variant is substituted.
+        """
+        self.mpk.paged_attention_layer(
+            input=attn_in,
+            k_cache=self.k_cache, v_cache=self.v_cache,
+            q_norm=self.dummy_norm, k_norm=self.dummy_norm,
+            cos_pos_embed=self.cos_pos_embed,
+            sin_pos_embed=self.sin_pos_embed,
+            output=attn_out,
+            grid_dim=(self.mpk.max_num_batched_requests, self.num_kv_heads, 1),
+            block_dim=bd,
+            enable_qk_norm=False,
+            is_draft=True,  # PR3: read the DRAFT KV mapping, not the target's
+            draft_step_s=s,
+        )
+
+    def build_draft_extend(self, seed_token, accepted_count, attn_fn=None,
+                           capture=None):
+        """General draft extend: one+K-step draft prefill seeded from the
+        prepared input. attn_fn(attn_in, attn_out, bd, s) is the pluggable
+        attention (defaults to eagle3 GQA). Requires prepare_draft_input to have
+        populated self.extend_seed_hidden first.
+
+        Mirrors the build_draft_loop step body but (a) seeds step-0 hidden from
+        extend_seed_hidden (not the in-loop aux→fc), and (b) uses the draft
+        mapping via attn_fn with the per-step s.
+
+        capture (DEBUG, optional): dict with keys 'fn' (layer_capture_layer),
+        'max_seq_len', and dump DTensors 'fc'/'attn_proj'/'midlayer'/'norm'.
+        When set, captures those step-0 sub-step tensors for the per-layer
+        MPK-vs-sglang comparison.
+        """
+        if attn_fn is None:
+            attn_fn = self._gqa_attn
+        bd = (256, 1, 1) if self.mpk.target_cc >= 90 else (128, 1, 1)
         K = self.num_draft_steps
         mbt = self.mbt
         H = self.hidden_size
 
-        # The block_dim convention: 256 for SM>=90 / Blackwell, 128 for Ampere.
-        bd_compute = (256, 1, 1) if self.mpk.target_cc >= 90 else (128, 1, 1)
-        bd_small = bd_compute
+        # Build the step-0 EXTEND embed seed: position-aware teacher-forcing.
+        # Prefill rows read the real shifted prompt (tokens[step+r+1]); decode
+        # rows fall back to seed_token (= argmax_out). Replaces the raw-argmax
+        # seed that embedded the main model's mispredictions during prefill.
+        self.mpk.mtp_build_embed_input_layer(
+            output_tokens=seed_token,
+            mtp_input_tokens=self.extend_embed_seed,
+            grid_dim=(1, 1, 1), block_dim=bd,
+            batch_size=mbt, max_seq_len=self.mpk.max_seq_length,
+        )
 
         for step in range(K):
-            draft_in_token = target_argmax_token if step == 0 else self.target_token
+            draft_in_token = self.extend_embed_seed if step == 0 else self.target_token
+            # eagle3's draft processes all mbt parallel rows; step-0 hidden is
+            # the FULL projected target hidden (concat(aux)→fc = self.hidden_in,
+            # produced by prepare_draft_input). NOTE: do NOT use the
+            # accepted-only gathered seed here — zeroing rows >= accepted_count
+            # feeds the draft's parallel branches zero hidden and collapses the
+            # accept rate. The accepted-row gather is the DeepSeek single-chain
+            # MTP formulation (PR4), not eagle3's mbt-parallel structure.
+            step_hidden = self.hidden_in if step == 0 else self.draft_hidden
 
+            def _cap(key, tensor):
+                if capture is not None and step == 0 and key in capture:
+                    capture["fn"](input=tensor, output=capture[key],
+                                  grid_dim=(1, 1, 1), block_dim=bd,
+                                  max_seq_len=capture["max_seq_len"])
+
+            _cap("fc", self.hidden_in)
             self.mpk.embed_layer(
                 input=draft_in_token, weight=self.target_w_embed,
                 output=self.embed_out,
-                grid_dim=(1, 1, 1), block_dim=bd_small,
-                input_source=1,
+                grid_dim=(1, 1, 1), block_dim=bd, input_source=1,
             )
-
-            if step == 0:
-                self.mpk.concat_layer(
-                    inputs=[aux_h0, aux_h1, aux_h2],
-                    output=self.aux_concat_out,
-                    grid_dim=(1, 1, 1), block_dim=bd_compute,
-                )
-                self.mpk.linear_layer(
-                    input=self.aux_concat_out, weight=self.w_fc,
-                    output=self.hidden_in,
-                    grid_dim=(grid_for_rmsnorm_linear_layer(self.w_fc.dim(0)), 1, 1),
-                    block_dim=bd_small,
-                )
-                step_hidden = self.hidden_in
-            else:
-                step_hidden = self.draft_hidden
-
             self.mpk.rmsnorm_layer(
                 input=self.embed_out, weight=self.w_input_ln,
                 output=self.embed_normed,
-                grid_dim=(mbt, 1, 1), block_dim=bd_small,
+                grid_dim=(mbt, 1, 1), block_dim=bd,
             )
             self.mpk.rmsnorm_layer(
                 input=step_hidden, weight=self.w_hidden_norm,
                 output=self.hidden_normed,
-                grid_dim=(mbt, 1, 1), block_dim=bd_small,
+                grid_dim=(mbt, 1, 1), block_dim=bd,
             )
             self.mpk.concat_layer(
                 inputs=[self.embed_normed, self.hidden_normed],
                 output=self.qkv_in_2H,
-                grid_dim=(1, 1, 1), block_dim=bd_compute,
+                grid_dim=(1, 1, 1), block_dim=bd,
             )
-
             self.mpk.linear_layer(
                 input=self.qkv_in_2H, weight=self.w_qkv, output=self.attn_in,
                 grid_dim=(grid_for_rmsnorm_linear_layer(self.w_qkv.dim(0)), 1, 1),
-                block_dim=bd_small,
+                block_dim=bd,
             )
-
-            if K == 1:
-                self.mpk.paged_attention_layer(
-                    input=self.attn_in,
-                    k_cache=self.k_cache, v_cache=self.v_cache,
-                    q_norm=self.dummy_norm, k_norm=self.dummy_norm,
-                    cos_pos_embed=self.cos_pos_embed,
-                    sin_pos_embed=self.sin_pos_embed,
-                    output=self.attn_out,
-                    grid_dim=(self.mpk.max_num_batched_requests,
-                              self.num_kv_heads, 1),
-                    block_dim=bd_small,
-                    enable_qk_norm=False,
-                )
-            else:
-                self.mpk.paged_attention_layer(
-                    input=self.attn_in,
-                    k_cache=self.k_cache, v_cache=self.v_cache,
-                    q_norm=self.dummy_norm, k_norm=self.dummy_norm,
-                    cos_pos_embed=self.cos_pos_embed,
-                    sin_pos_embed=self.sin_pos_embed,
-                    output=self.attn_out,
-                    grid_dim=(self.mpk.max_num_batched_requests,
-                              self.num_kv_heads, 1),
-                    block_dim=bd_small,
-                    enable_qk_norm=False,
-                    q_len_override=1,
-                    tail_offset=K - step,
-                )
-
+            attn_fn(self.attn_in, self.attn_out, bd, step)
             self.mpk.linear_with_residual_layer(
                 input=self.attn_out, weight=self.w_o,
                 residual=step_hidden, output=self.attn_proj_out,
-                grid_dim=(H // 64, 1, 1), block_dim=bd_small,
+                grid_dim=(H // 64, 1, 1), block_dim=bd,
             )
-
+            _cap("attn_proj", self.attn_proj_out)
             self.mpk.rmsnorm_layer(
                 input=self.attn_proj_out, weight=self.w_post_ln,
                 output=self.post_ln_out,
-                grid_dim=(mbt, 1, 1), block_dim=bd_small,
+                grid_dim=(mbt, 1, 1), block_dim=bd,
             )
-
             gateup_num_tasks = grid_for_rmsnorm_linear_layer(self.w_gateup.dim(0))
             self.mpk.linear_layer(
                 input=self.post_ln_out, weight=self.w_gateup,
                 output=self.mlp_mid,
-                grid_dim=(gateup_num_tasks, 1, 1), block_dim=bd_small,
+                grid_dim=(gateup_num_tasks, 1, 1), block_dim=bd,
             )
             self.mpk.silu_mul_layer(
                 input=self.mlp_mid, output=self.silu_mul_out,
-                grid_dim=(gateup_num_tasks // 2, 1, 1), block_dim=bd_small,
+                grid_dim=(gateup_num_tasks // 2, 1, 1), block_dim=bd,
             )
             self.mpk.linear_with_residual_layer(
                 input=self.silu_mul_out, weight=self.w_down,
                 residual=self.attn_proj_out, output=self.draft_hidden,
-                grid_dim=(H // 64, 1, 1), block_dim=bd_small,
+                grid_dim=(H // 64, 1, 1), block_dim=bd,
             )
-
+            _cap("midlayer", self.draft_hidden)
             self.mpk.rmsnorm_layer(
                 input=self.draft_hidden, weight=self.w_final_norm,
                 output=self.norm_out,
-                grid_dim=(mbt, 1, 1), block_dim=bd_small,
+                grid_dim=(mbt, 1, 1), block_dim=bd,
             )
+            _cap("norm", self.norm_out)
             self.mpk.linear_layer(
                 input=self.norm_out, weight=self.w_lm_head,
                 output=self.logits_hot,
                 grid_dim=(grid_for_rmsnorm_linear_layer(self.w_lm_head.dim(0)), 1, 1),
-                block_dim=bd_small,
+                block_dim=bd,
             )
-
             self.mpk.argmax_partial_layer(
                 input=self.logits_hot,
                 output=(self.argmax_part_value, self.argmax_part_index),
-                grid_dim=(self.mpk.num_workers, 1, 1), block_dim=bd_small,
+                grid_dim=(self.mpk.num_workers, 1, 1), block_dim=bd,
             )
             self.mpk.argmax_reduce_layer(
                 input=(self.argmax_part_value, self.argmax_part_index),
                 output=self.hot_token,
-                grid_dim=(1, 1, 1), block_dim=bd_small,
+                grid_dim=(1, 1, 1), block_dim=bd,
             )
-
             self.mpk.eagle3_d2t_remap_layer(
                 hot_token=self.hot_token, d2t_table=self.d2t,
                 target_token=self.target_token,
-                grid_dim=(1, 1, 1), block_dim=bd_small,
+                grid_dim=(1, 1, 1), block_dim=bd,
                 draft_vocab_real=self.draft_vocab_size,
             )
-
             self.mpk.mtp_token_scatter_layer(
                 src=self.target_token, dst=self.all_draft_ids,
-                grid_dim=(1, 1, 1), block_dim=bd_small,
+                grid_dim=(1, 1, 1), block_dim=bd,
                 batch_size=mbt, num_slots=K, slot_idx=step,
             )
-
         return self.all_draft_ids
 
 
@@ -458,4 +555,6 @@ def load_eagle3_draft(draft_model_path_or_repo: str):
     with open(os.path.join(path, "config.json")) as fp:
         config = json.load(fp)
     state_dict = _load_draft_state_dict(path)
+    if _is_speculators_format(config):
+        state_dict, config = _adapt_speculators_eagle3(state_dict, config)
     return state_dict, config

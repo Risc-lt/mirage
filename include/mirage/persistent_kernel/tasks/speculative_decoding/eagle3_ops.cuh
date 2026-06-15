@@ -47,6 +47,35 @@ __device__ __forceinline__ void
   }
 }
 
+// --- DEBUG: position-indexed layer capture (per-layer/sub-step compare) ---
+// Copy the src [NUM_ROWS, HIDDEN] tensor into a persistent dst[MAX_SEQ_LEN,
+// HIDDEN] buffer at absolute rows [step .. step+NUM_ROWS), so the mbt prompt
+// positions processed in one prefill chunk all land at their true positions
+// (prefill advances step by NUM_ROWS=mbt/iter; capturing only row 0 left
+// stride-mbt holes). Env-gated harness; not used in production paths.
+template <typename T, int HIDDEN_DIM, int MAX_SEQ_LEN, int NUM_ROWS>
+__device__ __forceinline__ void
+    layer_capture_kernel(void const *__restrict__ src_ptr,
+                         void const *__restrict__ step_ptr,
+                         void *__restrict__ dst_ptr,
+                         int request_id) {
+  T const *__restrict__ src = static_cast<T const *>(src_ptr);
+  T *__restrict__ dst = static_cast<T *>(dst_ptr);
+  int const *__restrict__ step = static_cast<int const *>(step_ptr);
+  int const base = step[request_id];
+  int const tid = threadIdx.x;
+  int const stride = blockDim.x;
+  for (int r = 0; r < NUM_ROWS; r++) {
+    int const row = base + r;
+    if (row < 0 || row >= MAX_SEQ_LEN) {
+      continue;
+    }
+    for (int i = tid; i < HIDDEN_DIM; i += stride) {
+      dst[row * HIDDEN_DIM + i] = src[r * HIDDEN_DIM + i];
+    }
+  }
+}
+
 // --- Tensor Concatenation along dim 1 ---
 // Concatenates N (BATCH_SIZE, HIDDEN_DIM) tensors along dim 1, producing
 // (BATCH_SIZE, N * HIDDEN_DIM).
@@ -121,79 +150,104 @@ __device__ __forceinline__ void
   }
 }
 
-// --- Eagle3 Commit (verify-aware token buffer write + step-advance signal +
-//                    cross-iter draft snapshot) ---
+// --- MTP Verify + Commit (merged; draft-extend design, PR2) ---
 //
-// Replaces mtp_prepare_verify + mtp_accept_commit for Eagle3's K=1+ flow.
-// Runs once at end of iter, handling four responsibilities atomically:
+// Replaces the (verify_strict → eagle3_commit) pair on the draft-extend path.
+// Folds the strict accept-walk and the token-buffer commit into ONE kernel and
+// — crucially — DROPS the `src_slot` selection of `draft_tokens_new`. In the
+// draft-extend design the next iteration's draft chain is NOT a slot of this
+// iteration's parallel-branch output; it is produced by the extend stage
+// (`_build_draft_extend`), which re-seeds the draft from the confirmed tokens +
+// the target hidden at the accepted positions. So this kernel's only jobs are:
 //
-//  1. Write the verified prefix (accepted drafts + bonus) into the tokens
-//     buffer at positions [step+1 .. step+accepted_count], guarded against
-//     overwriting the prompt (`pos >= prompt_len`).
-//  2. Write the K new draft tokens (for next iter's input) at positions
-//     [step+accepted_count+1 .. step+accepted_count+K], same guard.
-//  3. Publish `accepted_count` to `new_token_nums[req]` so the OFFLINE
-//     runtime's prepare_next_batch can advance step by accept_count past
-//     prefill (gated by MPK_SPEC_DECODE).
-//  4. Copy `draft_tokens_new` into `drafts_prev_attached` (an attach_input
-//     tensor not tracked as a graph edge). Next iter's verify_strict reads
-//     `drafts_prev_attached`, which still holds iter N's value when iter N+1
-//     runs — solving the cross-iter "verify needs prev iter's drafts" problem
-//     without violating the unique-edge-per-pair MPK invariant.
+//   1. Strict accept-walk: compare the previous iter's draft chain (carried in
+//      tokens[step+1..step+K], written by mtp_draft_token_copy) vs the target's
+//      argmax[0..K-1]; accept the matching prefix; accepted_count = (#accepted)
+//      + 1 for the bonus token (lies in [1, K+1]).
+//   2. Write the confirmed tokens (= target argmax over the accepted prefix +
+//      bonus) into tokens_buffer at [step+1 .. step+accepted_count], guarded
+//      against overwriting the prompt.
+//   3. Publish accepted_count to new_token_nums[req] (scheduler-contract field;
+//      the OFFLINE runtime's prepare_next_batch advances target step by it).
+//   4. Publish accepted_count to the in-graph `accepted_count_out` consumed by
+//      hidden_gather_accepted + the draft extend builder (this iteration).
 //
-// `accepted_count` here is verify_strict's output = final_accepted + 1,
-// so it lies in [1, K+1].
+// It does NOT write next-iter drafts and does NOT read any draft slot beyond
+// the accept-walk comparison, so accept-0 reads no rejected draft slot (AC-9).
+//
+// Pluggable acceptance: AcceptPolicy is a compile-time selector. STRICT_GREEDY
+// is the only policy implemented here (the probabilistic path stays standalone
+// per the path boundaries); the enum is the seam for future policies.
 //
 // Inputs:
-//   tokens_buffer    [MAX_REQ, MAX_SEQ_LEN] int64 — full seq buffer
-//   argmax_out       [BATCH_SIZE]           int64 — target argmax (K+1)
-//   draft_tokens_new [BATCH_SIZE, K]        int64 — this iter's draft (next in)
-//   accepted_count   [BATCH_SIZE]           int32 — from verify_strict
-//   step             [MAX_REQ]              int32 — current step
-//   prompt_length    [MAX_REQ]              int32 — req's prompt length
+//   argmax_out        [K+1]                  int64 — target argmax (K+1 pos)
+//   step              [MAX_REQ]              int32 — current confirmed length
+//   prompt_length     [MAX_REQ]              int32 — req's prompt length
+//   tokens_buffer also supplies the draft chain at [step+1..step+K] (see #1)
 // Outputs:
-//   new_token_nums   [MAX_REQ]              int32 — accepted_count for runtime
-//   drafts_prev      [MAX_REQ, K]           int64 — attach_input snapshot
-template <int K, int BATCH_SIZE, int MAX_SEQ_LEN>
+//   tokens_buffer     [MAX_REQ, MAX_SEQ_LEN] int64 — confirmed-token write
+//   new_token_nums    [MAX_REQ]              int32 — accepted_count for runtime
+//   accepted_count_out[1]                    int32 — in-graph accepted_count
+//   accept_hist       [..]                   int32 — optional instrumentation
+enum class AcceptPolicy { STRICT_GREEDY = 0 };
+
+template <int K,
+          int MAX_SEQ_LEN,
+          AcceptPolicy POLICY = AcceptPolicy::STRICT_GREEDY>
 __device__ __forceinline__ void
-    eagle3_commit_kernel(void *__restrict__ tokens_buffer_ptr,
-                         void const *__restrict__ argmax_out_ptr,
-                         void const *__restrict__ draft_tokens_new_ptr,
-                         void const *__restrict__ accepted_count_ptr,
-                         void const *__restrict__ step_ptr,
-                         void const *__restrict__ prompt_length_ptr,
-                         void *__restrict__ new_token_nums_ptr,
-                         void *__restrict__ drafts_prev_ptr,
-                         void *__restrict__ accept_hist_ptr,
-                         int request_id) {
-  // Single-edge per (producer, consumer) pair design:
-  //   argmax_out (from argmax_reduce)             : 1 edge
-  //   draft_tokens_new (from mtp_token_scatter)   : 1 edge
-  //   accepted_count (from mtp_verify_strict)     : 1 edge
-  //   tokens_buffer / new_token_nums / drafts_prev: attach_input (no edges)
-  long long *__restrict__ tokens = static_cast<long long *>(tokens_buffer_ptr);
+    mtp_verify_commit_kernel(void const *__restrict__ argmax_out_ptr,
+                             void const *__restrict__ step_ptr,
+                             void const *__restrict__ prompt_length_ptr,
+                             void *__restrict__ tokens_buffer_ptr,
+                             void *__restrict__ new_token_nums_ptr,
+                             void *__restrict__ accepted_count_out_ptr,
+                             void *__restrict__ accept_hist_ptr,
+                             int request_id) {
+  static_assert(POLICY == AcceptPolicy::STRICT_GREEDY,
+                "mtp_verify_commit: only STRICT_GREEDY implemented in PR2");
+
   long long const *__restrict__ argmax =
       static_cast<long long const *>(argmax_out_ptr);
-  long long const *__restrict__ drafts =
-      static_cast<long long const *>(draft_tokens_new_ptr);
-  int const *__restrict__ accepted_count =
-      static_cast<int const *>(accepted_count_ptr);
   int const *__restrict__ step = static_cast<int const *>(step_ptr);
   int const *__restrict__ prompt_length =
       static_cast<int const *>(prompt_length_ptr);
+  long long *__restrict__ tokens = static_cast<long long *>(tokens_buffer_ptr);
   int *__restrict__ new_token_nums = static_cast<int *>(new_token_nums_ptr);
-  long long *__restrict__ drafts_prev =
-      static_cast<long long *>(drafts_prev_ptr);
+  int *__restrict__ accepted_count_out =
+      static_cast<int *>(accepted_count_out_ptr);
 
   int t_id = threadIdx.x;
   int req = request_id;
 
   int cur_step = step[req];
   int prompt_len = prompt_length[req];
-  int ac = accepted_count[0];
 
-  // Write verified prefix at step+1 .. step+ac (only past prompt). Values
-  // come directly from argmax_out (target's argmax over K+1 positions).
+  // 1. Strict accept-walk (single-thread; K is tiny so no need to parallelize).
+  //    The draft chain for THIS iter lives in tokens[cur_step+1 .. cur_step+K]:
+  //    the previous iter's draft-token copy (mtp_draft_token_copy) wrote it
+  //    there, and prepare_next_batch advanced step to point at it. tokens is an
+  //    attach_input carried across the iteration barrier, so this read is the
+  //    same cross-iter carrier drafts_prev used to be (BL-20260610). Step 2
+  //    below overwrites tokens[cur_step+1 ..] with the confirmed argmax, but
+  //    the
+  //    __syncthreads() guarantees every thread finishes this read first.
+  __shared__ int ac_smem;
+  if (t_id == 0) {
+    int accepted = K;
+    for (int i = 0; i < K; i++) {
+      long long draft_i = tokens[req * MAX_SEQ_LEN + cur_step + 1 + i];
+      if (draft_i != argmax[i]) {
+        accepted = i;
+        break;
+      }
+    }
+    ac_smem = accepted + 1; // +1 bonus token; in [1, K+1]
+  }
+  __syncthreads();
+  int ac = ac_smem;
+
+  // 2. Write confirmed tokens at step+1 .. step+ac (only past prompt). Values
+  //    come from the target argmax over the accepted prefix + bonus.
   if (t_id < ac) {
     int pos = cur_step + 1 + t_id;
     if (pos < MAX_SEQ_LEN && pos >= prompt_len) {
@@ -201,116 +255,15 @@ __device__ __forceinline__ void
     }
   }
 
-  // Select the source slot in all_draft_ids for the new K-token chain.
-  //
-  // K=1 produces mbt parallel chains (default attention processes all mbt
-  // input slots, each predicting one token under a different "ac assumption").
-  // Slot b's prediction is for position step_N + b + 2, so commit picks
-  // src_slot = ac - 1 to match the next iter's expected position.
-  //
-  // K>1 instead runs a sequential per-iter loop with Q_LEN_OVERRIDE=1, so the
-  // draft kernel writes only slot 0 of attn_out (see attention_sm100.cuh
-  // output-write loop bound by `num_tokens * NUM_QO_PER_KV * HEAD_DIM`).
-  // Slots 1..mbt-1 propagate stale/garbage values through the downstream
-  // rmsnorm → MLP → argmax → d2t_remap pipeline (each grid_dim=(mbt, ...))
-  // and into all_draft_ids[1..mbt-1, :]. Picking those rows commits garbage
-  // for next iter and collapses K>1 accept rate. Until a proper mbt-parallel
-  // K>1 chain is implemented, force slot 0. ac>=2 cases still write the
-  // chain at positions misaligned by (ac-1), but slot 0's chain is at least
-  // a valid prediction.
-  int src_slot = (K > 1) ? 0 : (ac - 1);
-  if (src_slot < 0) {
-    src_slot = 0;
-  }
-  if (src_slot >= BATCH_SIZE) {
-    src_slot = BATCH_SIZE - 1;
-  }
-
-  // Write K new drafts at step+ac+1 .. step+ac+K (only past prompt), drawn
-  // from the slot ac-1 chain.
-  if (t_id < K) {
-    int pos = cur_step + ac + 1 + t_id;
-    if (pos < MAX_SEQ_LEN && pos >= prompt_len) {
-      tokens[req * MAX_SEQ_LEN + pos] = drafts[src_slot * K + t_id];
-    }
-  }
-
-  // Snapshot current iter's drafts (shape [BATCH_SIZE=K+1, K]) into the
-  // attach_input slot for next iter's verify_strict to consume. The next iter's
-  // verify reads drafts_prev[0..K-1] (the first K entries).
-  // BUT FIRST: record the OLD drafts_prev (what THIS iter's verify just
-  // compared against argmax) into the trace, so we can byte-compare what was
-  // verified vs what the target predicted.
-  long long old_drafts_prev[8]; // K <= 8 (well bounded for spec decode)
-  if (t_id == 0) {
-    for (int i = 0; i < K; i++) {
-      old_drafts_prev[i] = drafts_prev[i];
-    }
-  }
-  if (t_id < K) {
-    drafts_prev[t_id] = drafts[src_slot * K + t_id];
-  }
-
-  // Debug-instrumentation: atomically increment accept-rate histogram bin
-  // for this iter's `ac`. `ac` lies in [1, K+1] (verify_strict guarantees);
-  // bin 0 is reserved for "iters that ran the commit kernel" sanity counter.
-  //
-  // Measured values (B200 GPU 4, Qwen3-30B-A3B, prompt-len 39, gen-len ~400):
-  //   K=1: hist=[0,184,154]      → step-0 accept = 45.6%   (matches baseline)
-  //   K=2: hist=[0,259,41,18]    → step-0 accept = 18.6%   (vs expected ~46%)
-  //                              → step-1 cond = 30.5%
-  //                              → per-draft = 12.1%
-  //
-  // Root cause investigation (2026-05-22):
-  //   - NOT the Q_LEN_OVERRIDE=1+TAIL_OFFSET=K-step path: running K=2 step 0
-  //     with DEFAULT attention (mbt=3, no overrides) still gives 19.7% step 0
-  //   - NOT the argmax_partial_grid_dim=(workers,1,1) restriction: the argmax
-  //     kernel iterates num_active_tokens=mbt internally regardless of grid_y,
-  //     so all mbt slots are computed
-  //   - NOT cross-step state corruption: scatter writes are column-wise
-  //     (step k writes column k), step ordering serialized by MPK
-  //   - ROOT CAUSE ISOLATED (via device-side trace, 2026-05-23): the bug is
-  //     in `paged_attention_sm100` at MAX_TOKENS=3, NOT in the eagle3 commit
-  //     or scatter logic. Byte-comparing K=1 (mbt=2) vs K=2 (mbt=3) traces on
-  //     the same prompt: at iter 0 both produce argmax[0]=12 (identical), but
-  //     at iter 1 with identical `tokens[step]=12` input and identical past
-  //     K/V cache content (causal mask should make slot 0 independent of
-  //     slots 1, 2), K=1 produces argmax[0]=17 while K=2 produces
-  //     argmax[0]=525. The target main fwd's slot-0 attention output diverges
-  //     between MAX_TOKENS=2 and MAX_TOKENS=3 despite identical mathematical
-  //     inputs to slot 0. Candidate fix sites in attention_sm100.cuh:
-  //       (a) MMA_ITERS_M=2 garbage propagation: m=1 tile has -inf m_local
-  //           that may NaN-poison slot 0's accumulator path
-  //       (b) causal mask formula `col + iter*KV_TILE <= token_idx + seq_len
-  //           - num_tokens` (line 519) at MAX_TOKENS=3 with small seq_len
-  //       (c) cache write/read overlap when seq_len-num_tokens shifts left by
-  //           one position from mbt=2 to mbt=3
-  if (t_id == 0 && accept_hist_ptr != nullptr) {
-    int *hist = static_cast<int *>(accept_hist_ptr);
-    atomicAdd(&hist[ac], 1);
-    // Tail trace: layout = [hist 0..K+1, trace_counter at K+2,
-    // then per-iter records of 2K+2 ints: (ac, argmax[0..K],
-    // drafts_prev[0..K-1])]. Capacity is host-allocated; we cap captured iters
-    // at 16 here.
-    int const TRACE_COUNTER_OFFSET = K + 2;
-    int const RECORD_SIZE = 2 * K + 2;
-    int const MAX_TRACE_ITERS = 16;
-    int trace_idx = atomicAdd(&hist[TRACE_COUNTER_OFFSET], 1);
-    if (trace_idx < MAX_TRACE_ITERS) {
-      int base = TRACE_COUNTER_OFFSET + 1 + trace_idx * RECORD_SIZE;
-      hist[base + 0] = ac;
-      for (int i = 0; i < K + 1; i++) {
-        hist[base + 1 + i] = (int)(argmax[i] & 0xFFFFFFFF);
-      }
-      for (int i = 0; i < K; i++) {
-        hist[base + 1 + (K + 1) + i] = (int)(old_drafts_prev[i] & 0xFFFFFFFF);
-      }
-    }
-  }
-
-  // Publish step-advance signal to runtime.
+  // 3/4. Publish accepted_count to the runtime (scheduler-contract) and to the
+  //      in-graph consumers (hidden_gather_accepted + draft extend).
   if (t_id == 0) {
     new_token_nums[req] = ac;
+    accepted_count_out[0] = ac;
+    if (accept_hist_ptr != nullptr) {
+      int *hist = static_cast<int *>(accept_hist_ptr);
+      atomicAdd(&hist[ac], 1);
+    }
   }
 }
 

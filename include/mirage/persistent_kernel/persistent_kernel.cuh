@@ -167,6 +167,19 @@ __global__ void init_kernel(RuntimeConfig config) {
     for (int i = 0; i < MPK_MAX_NUM_PAGES; i++) {
       config.page_queue[i] = i;
     }
+    // Independent draft KV mapping: zeroed indptrs, full free-list, step=0.
+    for (int i = 0; i < config.total_num_requests; i++) {
+      config.draft_step[i] = 0;
+    }
+    for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS + 1; i++) {
+      config.draft_qo_indptr_buffer[i] = 0;
+      config.draft_paged_kv_indptr_buffer[i] = 0;
+    }
+    *config.draft_page_queue_head = 0;
+    *config.draft_page_queue_tail = MPK_MAX_NUM_PAGES;
+    for (int i = 0; i < MPK_MAX_NUM_PAGES; i++) {
+      config.draft_page_queue[i] = i;
+    }
 #if defined(MODE_ONLINE_PINNED)
     // Initialize GPU-private ring cursors (pinned_req_ready[] and
     // pinned_comp_ready[] are already zeroed by Python)
@@ -257,6 +270,14 @@ __device__ __forceinline__ bool
         step_advance = num_tokens;
       }
       config.step[request_id] = step + step_advance;
+      // PR3 prefill-aware: the draft EXTEND processes the span just advanced
+      // over (step_advance tokens ending at the new step), NOT new_token_nums.
+      // During prefill new_token_nums is garbage, which previously made the
+      // draft write its K/V at the wrong positions -> holes/offset in the
+      // prompt-region draft KV. Stash the true span here for Step 5b's draft
+      // mapping. (draft_qo_indptr indexed by request_id as a per-req scratch;
+      // single-chain/topk=1 so no compacted-slot collision in this path.)
+      config.draft_qo_indptr_buffer[request_id] = step_advance;
 #else
       for (int j = 0; j < num_tokens; j++) {
         if (step + j + 1 >= prompt_len &&
@@ -383,6 +404,16 @@ __device__ __forceinline__ bool
           config.page_queue[page_queue_head % MPK_MAX_NUM_PAGES];
       page_queue_head++;
     }
+#ifdef MPK_SPEC_DECODE
+    // Seed the draft EXTEND span for this freshly-admitted request's first
+    // prefill chunk. A new request was NOT present in Step 1 this prepare call,
+    // so no draft span was stashed there; without this, Step 5b reads a stale
+    // ac=0 -> degenerate draft mapping and the first chunk [0, num_new) draft
+    // KV is never written (orphaned). step[new_id] is 0 here (set by init), so
+    // Step 5b computes base = 0 + num_new and the first EXTEND writes
+    // [base-ac, base) = [0, num_new).
+    config.draft_qo_indptr_buffer[next_request_id] = num_new_tokens;
+#endif
     num_tokens += num_new_tokens;
     num_pages += num_new_pages;
     num_reqs++;
@@ -401,6 +432,75 @@ __device__ __forceinline__ bool
   // Step 5: update page head tail
   *config.page_queue_head = page_queue_head;
   *config.page_queue_tail = page_queue_tail;
+
+  // Step 5b: build the INDEPENDENT draft paged-KV mapping (PR3, accepted-count
+  // driven). The draft attention reads its own draft_* buffers and must attend
+  // its own cache prefix [0..base) with q_len = ac at the s==0 EXTEND step
+  // (the draft-attention kernel derives the s>=1 DECODE geometry from base+s
+  // via the compile-time DRAFT_STEP_S). Here `base = step + ac` is already in
+  // config.step[req] (advanced earlier this call); ac = new_token_nums[req].
+  //
+  // Encoding read by multitoken_paged_attention_sm100 (draft variant), per
+  // compacted active request r:
+  //   draft_qo_indptr:  cumulative ac           (=> num_tokens = ac)
+  //   draft_paged_kv_indptr/indices/last_page_len: pages spanning [0..base),
+  //     sized to cover base+K so DECODE steps crossing a page have their page.
+  //   draft_step[req] = base.
+  // Single linear chain per request; draft pages mirror the request's own pool
+  // (draft cache is dedicated; page p of request r lives at the same logical
+  // page index as the target for this single-chain topk=1 path).
+  {
+    // K = draft chain length. Spec-decode feeds mbt = K+1 candidates/iter
+    // (1 bonus + K drafts), so K = MPK_MAX_NUM_BATCHED_TOKENS - 1.
+    int const K = MPK_MAX_NUM_BATCHED_TOKENS - 1; // draft chain length
+    int draft_qo = 0;
+    int draft_pg = 0;
+    for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+      int16_t request_id = config.request_ids[i];
+      // Read the prefill-aware EXTEND span stashed in Step 1 (= step_advance:
+      // accepted_count in decode, prefill-chunk size in prefill) BEFORE the
+      // line below overwrites draft_qo_indptr_buffer with the compacted offset.
+      int const ac =
+          (request_id == -1) ? 0 : config.draft_qo_indptr_buffer[request_id];
+      config.draft_qo_indptr_buffer[i] = draft_qo;
+      config.draft_paged_kv_indptr_buffer[i] = draft_pg;
+      if (request_id == -1) {
+        continue;
+      }
+      // base = config.step + ac: the draft cache prefix end (base-ac=config.step
+      // = first candidate-window position P). The s==0 EXTEND writes the FULL
+      // candidate window [P, P+mbt) (not just the ac confirmed rows) so that
+      // consecutive per-iter windows TILE contiguously and no committed position
+      // is left a zero-KV hole (an ac=1 iter that wrote only [P,P+1) used to
+      // strand the next ac>=2 iter's first position). See the draft attention
+      // entry's s==0 num_tokens=mbt override, which depends on this base.
+      int const base = config.step[request_id] + ac;
+      // EXTEND query rows = ac (the span just advanced over: accepted_count in
+      // decode, the prefill chunk in prefill — NOT garbage new_token_nums).
+      draft_qo += (ac > 0 ? ac : 1);
+      // Page span must cover the whole draft chain [0 .. base+K) so a DECODE
+      // step crossing a page boundary still has its page mapped.
+      int const max_kv = base + K;
+      int const n_pages = (max_kv + MPK_PAGE_SIZE - 1) / MPK_PAGE_SIZE;
+      for (int p = 0; p < n_pages; p++) {
+        config.draft_paged_kv_indices_buffer[draft_pg + p] =
+            config.paged_kv_indices_snapshot[config.paged_kv_indptr_buffer[i] +
+                                             p];
+      }
+      draft_pg += n_pages;
+      // last_page_len encodes seq_len=base for the EXTEND read:
+      //   indptr_seq_len = (n_pages-1)*PAGE + last_page_len  must equal base.
+      config.draft_paged_kv_last_page_len_buffer[i] =
+          base - (n_pages - 1) * MPK_PAGE_SIZE;
+      // draft_step is indexed by the COMPACTED slot i (the draft attention
+      // kernel reads draft_step[request_id] where its request_id IS the
+      // compacted slot, mirroring how qo_indptr/paged_kv_* are indexed).
+      config.draft_step[i] = base;
+    }
+    config.draft_qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS] = draft_qo;
+    config.draft_paged_kv_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS] =
+        draft_pg;
+  }
 
   // printf("Next batch: steps[%d %d %d %d] num_active_tokens(%d)\n",
   //        config.step[0],
@@ -1590,6 +1690,24 @@ extern "C" void
       gpu_malloc<int>(MPK_MAX_NUM_PAGES * sizeof(int));
   global_runtime_config.page_queue_head = gpu_malloc<int>(sizeof(int));
   global_runtime_config.page_queue_tail = gpu_malloc<int>(sizeof(int));
+  // Independent draft KV mapping: own slab, gpu_malloc'd internally (no Python
+  // meta tensors). Mirrors the target's paged-KV buffers + free-list.
+  global_runtime_config.draft_step =
+      gpu_malloc<int>(sizeof(int) * total_num_requests);
+  global_runtime_config.draft_qo_indptr_buffer =
+      gpu_malloc<int>(sizeof(int) * (MPK_MAX_NUM_BATCHED_REQUESTS + 1));
+  global_runtime_config.draft_paged_kv_indptr_buffer =
+      gpu_malloc<int>(sizeof(int) * (MPK_MAX_NUM_BATCHED_REQUESTS + 1));
+  global_runtime_config.draft_paged_kv_indices_buffer =
+      gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_PAGES);
+  global_runtime_config.draft_paged_kv_last_page_len_buffer =
+      gpu_malloc<int>(sizeof(int) * (MPK_MAX_NUM_BATCHED_REQUESTS + 1));
+  global_runtime_config.draft_paged_kv_indices_snapshot =
+      gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_PAGES);
+  global_runtime_config.draft_page_queue =
+      gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_PAGES);
+  global_runtime_config.draft_page_queue_head = gpu_malloc<int>(sizeof(int));
+  global_runtime_config.draft_page_queue_tail = gpu_malloc<int>(sizeof(int));
   global_runtime_config.total_num_requests = total_num_requests;
 #if defined(MODE_ONLINE_PINNED)
   // GPU-private ring cursors; never accessed by CPU.

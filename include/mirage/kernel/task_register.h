@@ -97,6 +97,8 @@ public:
                                  bool with_residual);
   int register_paged_attention_sm100_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
+  int register_paged_attention_sm100_draft_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_argmax_partial_sm100_task(threadblock::Graph const &bgraph,
                                          std::vector<int> const &params);
   int register_argmax_reduce_sm100_task(threadblock::Graph const &bgraph,
@@ -186,12 +188,18 @@ public:
   // Eagle3 tasks
   int register_copy_task(threadblock::Graph const &bgraph,
                          std::vector<int> const &params);
+  int register_layer_capture_task(threadblock::Graph const &bgraph,
+                                  std::vector<int> const &params);
   int register_concat_task(threadblock::Graph const &bgraph,
                            std::vector<int> const &params);
   int register_eagle3_d2t_remap_task(threadblock::Graph const &bgraph,
                                      std::vector<int> const &params);
-  int register_eagle3_commit_task(threadblock::Graph const &bgraph,
-                                  std::vector<int> const &params);
+  int register_mtp_verify_commit_task(threadblock::Graph const &bgraph,
+                                      std::vector<int> const &params);
+  int register_hidden_gather_accepted_task(threadblock::Graph const &bgraph,
+                                           std::vector<int> const &params);
+  int register_mtp_draft_token_copy_task(threadblock::Graph const &bgraph,
+                                         std::vector<int> const &params);
   // SM100 tasks end
   // Multi-GPU tasks
   int register_nvshmem_allgather_strided_put_task(

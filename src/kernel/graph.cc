@@ -606,6 +606,12 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id = task_register->register_paged_attention_sm100_task(
         customized->bgraph, params);
     task_config[op] = std::make_tuple(7, 1, TASK_ATTN_SM100, variant_id);
+  } else if (name == "paged_attention_sm100_draft") {
+    // PR3: draft attention reading the DRAFT KV mapping (same 7-in/1-out
+    // shape).
+    int variant_id = task_register->register_paged_attention_sm100_draft_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(7, 1, TASK_ATTN_SM100_DRAFT, variant_id);
   } else if (name == "argmax_partial_sm100") {
     int variant_id = task_register->register_argmax_partial_sm100_task(
         customized->bgraph, params);
@@ -838,6 +844,11 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id =
         task_register->register_copy_task(customized->bgraph, params);
     task_config[op] = std::make_tuple(1, 1, TASK_COPY, variant_id);
+  } else if (name == "layer_capture") {
+    // DEBUG: 1 in (src), 1 out (persistent buffer); step from runtime_config.
+    int variant_id =
+        task_register->register_layer_capture_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 1, TASK_LAYER_CAPTURE, variant_id);
   } else if (name == "concat") {
     // params[2] = N (number of (B,H) inputs concatenated along dim 1).
     int n = params[2];
@@ -848,14 +859,30 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id = task_register->register_eagle3_d2t_remap_task(
         customized->bgraph, params);
     task_config[op] = std::make_tuple(2, 1, TASK_EAGLE3_D2T_REMAP, variant_id);
-  } else if (name == "eagle3_commit") {
-    int variant_id =
-        task_register->register_eagle3_commit_task(customized->bgraph, params);
-    // Inputs:  argmax_out, draft_tokens_new, accepted_count, tokens_buffer,
-    //          accept_hist (attach_input, kernel writes via atomicAdd; debug)
-    // Outputs: new_token_nums, drafts_prev (cross-iter snapshot)
+  } else if (name == "mtp_verify_commit") {
+    int variant_id = task_register->register_mtp_verify_commit_task(
+        customized->bgraph, params);
+    // Inputs:  argmax_out, tokens_buffer (write-through; ALSO supplies the
+    //          draft chain at [step+1..step+K]), accept_hist (attach_input)
+    // Outputs: new_token_nums, accepted_count_out
     // (step / prompt_length read from runtime_config)
-    task_config[op] = std::make_tuple(5, 2, TASK_EAGLE3_COMMIT, variant_id);
+    task_config[op] = std::make_tuple(3, 2, TASK_MTP_VERIFY_COMMIT, variant_id);
+  } else if (name == "hidden_gather_accepted") {
+    int variant_id = task_register->register_hidden_gather_accepted_task(
+        customized->bgraph, params);
+    // Inputs:  verify_hidden [K+1,H], accepted_count (in-graph)
+    // Outputs: extend_seed [K+1,H]
+    task_config[op] =
+        std::make_tuple(2, 1, TASK_HIDDEN_GATHER_ACCEPTED, variant_id);
+  } else if (name == "mtp_draft_token_copy") {
+    int variant_id = task_register->register_mtp_draft_token_copy_task(
+        customized->bgraph, params);
+    // Inputs:  all_draft_ids [mbt,K] (scatter output edge),
+    //          accepted_count (in-graph)
+    // Outputs: tokens_buffer [MAX_REQ,MAX_SEQ_LEN] (attach_input, non-edge)
+    // (step read from runtime_config)
+    task_config[op] =
+        std::make_tuple(2, 1, TASK_MTP_DRAFT_TOKEN_COPY, variant_id);
   }
   // Multi-GPU tasks
   else if (name == "nvshmem_allgather_strided_put") {
